@@ -260,3 +260,52 @@ select.field { appearance: none; }
     scroll-behavior: auto !important;
   }
 }
+
+/* ----------------------------------------------- reduced effects (fx-lite) */
+/* Weak-GPU mode (Raspberry Pi class boards, software rendering): solid
+   panels instead of translucent blur, no glows, no decorative animation.
+   The `fx-lite` class on <html> is maintained by composables/effects.ts —
+   auto-detected on first run, toggleable in Settings → Appearance. */
+
+html.fx-lite *,
+html.fx-lite *::before,
+html.fx-lite *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+  backdrop-filter: none !important;
+}
+
+/* Progress spinners stay meaningful — a tiny repaint area is affordable. */
+html.fx-lite .animate-spin {
+  animation-duration: 1s !important;
+  animation-iteration-count: infinite !important;
+}
+
+html.fx-lite .glass {
+  background: var(--color-ink-850);
+  box-shadow: none;
+}
+
+html.fx-lite .glass-inset {
+  background: var(--color-ink-950);
+}
+
+/* The pulse halo would otherwise force a full-panel repaint every frame. */
+html.fx-lite .dot::after {
+  display: none;
+}
+
+html.fx-lite .hover-glow:hover {
+  box-shadow: none;
+  border-color: rgb(255 255 255 / 0.16);
+}
+
+html.fx-lite .shadow-glow-brass {
+  box-shadow: none;
+}
+
+html.fx-lite .btn-primary {
+  box-shadow: none;
+}

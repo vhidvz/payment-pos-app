@@ -157,8 +157,29 @@ fn sync_autostart(app: &AppHandle, enabled: bool) {
     }
 }
 
+/// Work around WebKitGTK rendering corruption on weak or quirky GPU stacks.
+///
+/// The DMA-BUF renderer draws streaked/banded frames on several Mesa and
+/// proprietary drivers, and on ARM boards (Raspberry Pi class) accelerated
+/// compositing itself is the usual source of artifacts and crashes. Both
+/// variables are only defaulted — exporting them before launch still wins.
+#[cfg(target_os = "linux")]
+fn tune_webview_env() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_webview_env() {}
+
 pub fn run() {
     init_tracing();
+    tune_webview_env();
     let state = build_state();
     let background = std::env::args().any(|a| a == "--background" || a == "--minimized");
 

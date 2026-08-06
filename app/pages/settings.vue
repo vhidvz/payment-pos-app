@@ -73,6 +73,21 @@
         </div>
       </GlassCard>
 
+      <!-- appearance -->
+      <GlassCard data-reveal>
+        <h2 class="display mb-5 text-xl text-paper">Appearance</h2>
+        <div class="flex items-center justify-between gap-6">
+          <div>
+            <div class="text-sm text-paper">Reduced visual effects</div>
+            <p class="text-xs text-paper-mute">
+              Solid panels instead of blur, glow and animation — for weak GPUs and Raspberry Pi class boards.
+              Detected automatically on first run; applies immediately and is remembered per device.
+            </p>
+          </div>
+          <TSwitch v-model="reducedFx" label="Reduced visual effects" />
+        </div>
+      </GlassCard>
+
       <!-- provider -->
       <GlassCard data-reveal>
         <h2 class="display mb-1 text-xl text-paper">Active provider</h2>
@@ -120,6 +135,11 @@ const providerList = ref<ProviderSummary[]>([])
 const settingsFile = ref('')
 const saving = ref(false)
 const loadError = ref('')
+
+const reducedFx = computed({
+  get: () => useReducedEffects().value,
+  set: (v: boolean) => setReducedEffects(v),
+})
 
 const corsText = computed({
   get: () => model.value?.server.corsAllowedOrigins.join('\n') ?? '',

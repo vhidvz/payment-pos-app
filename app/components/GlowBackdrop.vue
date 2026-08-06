@@ -2,6 +2,8 @@
   <div aria-hidden="true" class="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
     <!-- base wash -->
     <div class="absolute inset-0 bg-ink-950" />
+    <!-- decorative layers cost full-viewport blends — skip them on weak GPUs -->
+    <template v-if="!reduced">
     <!-- brass aurora, top left -->
     <div
       class="absolute -top-[30%] -left-[12%] h-[70vh] w-[70vw] rounded-full opacity-[0.13]"
@@ -33,10 +35,13 @@
       class="absolute inset-0"
       style="background: radial-gradient(ellipse 120% 90% at 50% 40%, transparent 55%, rgb(4 5 9 / 0.55) 100%)"
     />
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
+const reduced = useReducedEffects()
+
 const noise =
   'data:image/svg+xml,' +
   encodeURIComponent(

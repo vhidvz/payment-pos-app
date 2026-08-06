@@ -106,7 +106,7 @@
         </GlassCard>
 
         <!-- functions -->
-        <div class="space-y-3" data-reveal>
+        <div class="min-w-0 space-y-3" data-reveal>
           <div class="flex items-baseline justify-between">
             <h2 class="display text-xl text-paper">Function catalog</h2>
             <span class="text-xs text-paper-mute">{{ detail.functions.length }} functions</span>
@@ -152,11 +152,11 @@
                 <p class="font-mono text-xs leading-relaxed text-paper-mute">{{ f.returns }}</p>
               </div>
 
-              <div class="flex items-center justify-between">
-                <code class="rounded bg-ink-900 px-2 py-1 font-mono text-[0.6875rem] text-paper-mute">
+              <div class="flex items-center justify-between gap-3">
+                <code class="min-w-0 break-all rounded bg-ink-900 px-2 py-1 font-mono text-[0.6875rem] text-paper-mute">
                   POST /api/v1/providers/{{ detail.metadata.id }}/functions/{{ f.id }}/invoke
                 </code>
-                <NuxtLink :to="`/operations?provider=${detail.metadata.id}&fn=${f.id}`" class="text-xs text-brass-400 hover:text-brass-300">
+                <NuxtLink :to="`/operations?provider=${detail.metadata.id}&fn=${f.id}`" class="shrink-0 text-xs text-brass-400 hover:text-brass-300">
                   Try it →
                 </NuxtLink>
               </div>

@@ -1,9 +1,9 @@
 import { gsap } from 'gsap'
 
-/** True when the user asked the OS for reduced motion. */
+/** True when the user asked the OS for reduced motion, or fx-lite mode is on. */
 export function prefersReducedMotion(): boolean {
   if (typeof window === 'undefined') return true
-  return window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches || reducedEffectsActive()
 }
 
 /**
