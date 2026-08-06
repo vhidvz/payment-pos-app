@@ -1,0 +1,56 @@
+[package]
+name = "payment-pos-app"
+version = "0.1.0"
+description = "Ledger POS — a desktop bridge that exposes payment POS terminals as a local REST API"
+authors = ["Vahid V."]
+edition = "2021"
+default-run = "payment-pos-app"
+
+[lib]
+name = "payment_pos_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+des = "0.8"
+cbc = "0.1"
+cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+encoding_rs = "0.8"
+chrono = "0.4"
+dirs = "6"
+serialport = { version = "4", default-features = false }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+
+[[bin]]
+name = "payment-pos-app"
+path = "src/main.rs"
+
+# Headless REST-only daemon: the same core (settings, providers, HTTP API) without
+# any GUI — usable from a systemd user service or a terminal session.
+[[bin]]
+name = "posd"
+path = "src/bin/posd.rs"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

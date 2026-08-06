@@ -1,0 +1,25 @@
+# Node / Nuxt
+node_modules/
+.nuxt/
+.output/
+dist/
+.data/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+yarn-error.log
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
