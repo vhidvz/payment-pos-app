@@ -16,7 +16,9 @@ use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_autostart::MacosLauncher;
+#[cfg(not(target_os = "linux"))]
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::providers::{saman::SamanProvider, sandbox::SandboxProvider, ProviderRegistry};
@@ -146,13 +148,71 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Linux: write the XDG autostart entry ourselves instead of going through the
+/// autostart plugin, whose Linux backend emits `Exec=<path> <args>` unquoted —
+/// a path with a space (like the bundled `Ledger POS_*.AppImage`) yields an
+/// entry desktop environments refuse to parse, so nothing launches at login.
+/// Rewriting on every call also keeps the path fresh if the AppImage moves.
+#[cfg(target_os = "linux")]
+fn apply_autostart(app: &AppHandle, enabled: bool) -> std::io::Result<()> {
+    let name = app.package_info().name.clone();
+    let dir = dirs::config_dir()
+        .ok_or_else(|| std::io::Error::other("no XDG config directory"))?
+        .join("autostart");
+    // Same file name the autostart plugin used, so entries it wrote are replaced.
+    let file = dir.join(format!("{name}.desktop"));
+    if !enabled {
+        return match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let exe = match app.env().appimage {
+        // The AppImage path, not the transient /tmp/.mount_* exe inside it.
+        Some(appimage) => std::path::PathBuf::from(appimage),
+        None => std::env::current_exe()?,
+    };
+    // Desktop Entry spec: arguments containing spaces must be double-quoted,
+    // with the characters that stay special inside quotes backslash-escaped.
+    let quoted = format!(
+        "\"{}\"",
+        exe.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('`', "\\`")
+            .replace('$', "\\$")
+    );
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        &file,
+        format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Version=1.0\n\
+             Name={name}\n\
+             Comment={name} — start in the tray at login\n\
+             Exec={quoted} --background\n\
+             StartupNotify=false\n\
+             Terminal=false\n"
+        ),
+    )
+}
+
 fn sync_autostart(app: &AppHandle, enabled: bool) {
-    let autostart = app.autolaunch();
-    let result = if enabled { autostart.enable() } else { autostart.disable() };
-    if let Err(e) = result {
-        // Disabling when never enabled fails on some platforms — only surface real trouble.
-        if enabled {
-            tracing::warn!("failed to apply start-at-boot: {e}");
+    #[cfg(target_os = "linux")]
+    if let Err(e) = apply_autostart(app, enabled) {
+        tracing::warn!("failed to apply start-at-boot: {e}");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let autostart = app.autolaunch();
+        let result = if enabled { autostart.enable() } else { autostart.disable() };
+        if let Err(e) = result {
+            // Disabling when never enabled fails on some platforms — only surface real trouble.
+            if enabled {
+                tracing::warn!("failed to apply start-at-boot: {e}");
+            }
         }
     }
 }
