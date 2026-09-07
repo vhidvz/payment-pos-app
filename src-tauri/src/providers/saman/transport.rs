@@ -33,6 +33,8 @@ pub enum TransportError {
     Timeout(u128),
     #[error("not connected")]
     NotConnected,
+    #[error("terminal at {addr} refused the connection")]
+    ConnectionRefused { addr: String },
     #[error("connect timeout")]
     ConnectTimeout,
     #[error("io error: {0}")]
@@ -115,13 +117,37 @@ impl TcpTransport {
     }
 }
 
+impl TcpTransport {
+    /// Read whatever has already arrived and throw it away.
+    /// Returns true when the peer has closed (EOF observed).
+    fn drain_socket(&mut self) -> bool {
+        let Some(stream) = self.stream.as_mut() else {
+            return false;
+        };
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.try_read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(_) => return false, // WouldBlock: nothing left queued
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Transport for TcpTransport {
     async fn connect(&mut self) -> Result<(), TransportError> {
         let addr = format!("{}:{}", self.host, self.port);
         let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| TransportError::ConnectTimeout)??;
+            .map_err(|_| TransportError::ConnectTimeout)?
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::ConnectionRefused => {
+                    TransportError::ConnectionRefused { addr: addr.clone() }
+                }
+                _ => TransportError::Io(e),
+            })?;
         stream.set_nodelay(true).ok();
         self.stream = Some(stream);
         self.framer.clear();
@@ -174,21 +200,21 @@ impl Transport for TcpTransport {
         self.framer.clear();
         // Also drain anything already sitting in the kernel buffer, so a stale frame
         // from the previous step can't be misread as the next step's response.
-        if let Some(stream) = self.stream.as_mut() {
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stream.try_read(&mut buf) {
-                if n == 0 {
-                    self.stream = None;
-                    break;
-                }
-            }
+        if self.drain_socket() {
+            self.stream = None;
         }
     }
 
     fn close(&mut self) {
         self.framer.clear();
-        // Dropping the stream closes the fd; the OS flushes pending writes and
-        // handles the FIN handshake — no event loop to keep alive here.
+        // Drain before dropping. Closing a socket that still holds unread bytes
+        // makes the kernel send RST instead of FIN, and this terminal answers a
+        // reset by dropping the opening message of the *next* connection — the
+        // "first attempt always fails" behaviour. The reference SDK never meets
+        // this because Node drains the socket continuously; this client reads only
+        // when asked, so it has to drain deliberately.
+        self.drain_socket();
+        // Dropping the stream then closes the fd and sends FIN.
         self.stream = None;
     }
 }
@@ -337,6 +363,67 @@ mod tests {
         assert!(f.next().is_none());
         f.feed(&full[4..]);
         assert_eq!(f.next().unwrap(), vec![0x03, 0x00, 0x99]);
+    }
+
+    /// A closed port must be reported as such, naming the address: "io error:
+    /// Connection refused (os error 111)" tells an operator nothing about which
+    /// terminal was unreachable.
+    #[tokio::test]
+    async fn tcp_connect_to_a_closed_port_names_the_unreachable_address() {
+        // Bind then drop, so the port is known to be closed on loopback.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut t = TcpTransport::new("127.0.0.1", port, Duration::from_secs(2));
+        let err = t.connect().await.expect_err("connect to a closed port must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("127.0.0.1") && msg.contains(&port.to_string()),
+            "error should name the address it could not reach, got: {msg}"
+        );
+    }
+
+    /// Closing a socket that still has unread bytes makes Linux send RST instead
+    /// of FIN. The terminal is left with a reset connection and drops the opening
+    /// message of the next one — which is exactly the "first attempt always
+    /// fails" behaviour seen on real hardware. The reference SDK never hits this
+    /// because Node drains the socket continuously; this client only reads when
+    /// asked, so it must drain before closing.
+    #[tokio::test]
+    async fn closing_with_unread_data_still_shuts_down_cleanly() {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Something the client will never read: a late frame from the terminal.
+            sock.write_all(&[0x00, 0x06, 0x60, 0, 0, 0, 0, 0xAA]).await.unwrap();
+            sock.flush().await.unwrap();
+            // Give the client time to close.
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) => return Ok(()),          // FIN: a clean close
+                    Ok(_) => continue,
+                    Err(e) => return Err(e.kind()),  // RST shows up here
+                }
+            }
+        });
+
+        let mut t = TcpTransport::new("127.0.0.1", port, Duration::from_secs(2));
+        t.connect().await.unwrap();
+        // Let the unsolicited frame arrive in the kernel receive queue.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        t.close();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should observe the close")
+            .unwrap();
+        assert_eq!(outcome, Ok(()), "the peer saw a reset, not a clean shutdown");
     }
 
     #[test]

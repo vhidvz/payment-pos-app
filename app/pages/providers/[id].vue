@@ -9,10 +9,14 @@
         <template #actions>
           <div class="flex items-center gap-2">
             <StatusPill v-if="detail.active" tone="brass" label="active" />
-            <button v-else class="btn-ghost" type="button" @click="activate">Make active</button>
+            <button v-else class="btn-ghost" type="button" @click="locked ? requestUnlock() : activate()">
+              {{ locked ? 'Unlock to activate' : 'Make active' }}
+            </button>
           </div>
         </template>
       </PageHeader>
+
+      <LockBanner what="Provider settings" />
 
       <!-- meta strip -->
       <GlassCard data-reveal class="mb-6">
@@ -31,9 +35,10 @@
           </div>
           <div>
             <dt class="data-label mb-1">Status</dt>
-            <dd class="flex items-center gap-2 text-sm">
+            <dd class="flex flex-wrap items-center gap-2 text-sm">
               <StatusPill :tone="detail.status.configured ? 'ok' : 'warn'" :label="detail.status.configured ? 'configured' : 'needs setup'" />
               <StatusPill v-if="detail.status.sessionOpen" tone="warn" label="session open" />
+              <StatusPill v-if="pill" :tone="pill.tone" :label="pill.label" :title="link?.detail" />
             </dd>
           </div>
           <div class="col-span-2 md:col-span-4">
@@ -44,6 +49,10 @@
         <p v-if="detail.status.configurationHint" class="mt-4 rounded-lg border border-warn/25 bg-warn/6 px-3 py-2 text-xs text-warn">
           {{ detail.status.configurationHint }}
         </p>
+        <div v-if="link && link.state === 'down'" class="mt-4 rounded-lg border border-danger/25 bg-danger/6 px-3 py-2 text-xs text-danger">
+          <div class="font-medium">{{ link.detail }}</div>
+          <p v-if="link.hint" class="mt-1 leading-relaxed opacity-90">{{ link.hint }}</p>
+        </div>
         <a
           v-if="detail.metadata.docsUrl"
           :href="detail.metadata.docsUrl"
@@ -61,7 +70,8 @@
           <h2 class="display mb-1 text-xl text-paper">Configuration</h2>
           <p class="mb-5 text-xs text-paper-mute">Persisted to settings; applied immediately.</p>
 
-          <form class="space-y-4" @submit.prevent="saveConfig">
+          <form class="space-y-4" :class="locked && 'opacity-60'" @submit.prevent="locked ? requestUnlock() : saveConfig()">
+            <fieldset :disabled="locked" class="contents">
             <div v-for="(prop, key) in schemaProps" :key="key" class="space-y-1">
               <label :for="`cfg-${key}`" class="flex items-baseline gap-2">
                 <span class="font-mono text-[0.8125rem] text-paper">{{ key }}</span>
@@ -97,9 +107,11 @@
               <p class="text-xs leading-relaxed text-paper-mute">{{ prop.description }}</p>
             </div>
 
+            </fieldset>
+
             <div class="pt-2">
               <button type="submit" class="btn-primary w-full" :disabled="saving">
-                {{ saving ? 'Saving…' : 'Save configuration' }}
+                {{ locked ? 'Unlock to edit' : saving ? 'Saving…' : 'Save configuration' }}
               </button>
             </div>
           </form>
@@ -185,11 +197,14 @@ interface SchemaProp {
 }
 
 const api = useApi()
+const locked = useLocked()
 const route = useRoute()
 const root = ref<HTMLElement>()
 useReveal(root)
 
 const id = computed(() => String(route.params.id))
+const { status: link, refresh: refreshLink } = useProviderLink(id)
+const pill = computed(() => linkPill(link.value))
 const detail = ref<ProviderDetail | null>(null)
 const error = ref('')
 const cfg = reactive<Record<string, unknown>>({})
@@ -225,6 +240,8 @@ async function saveConfig() {
     await api.saveProviderConfig(id.value, { ...cfg })
     toast('ok', 'Configuration saved')
     await load()
+    // The address may have just changed; don't leave a stale light on screen.
+    await refreshLink()
   } catch (e) {
     toast('error', e instanceof Error ? e.message : 'Failed to save configuration')
   } finally {

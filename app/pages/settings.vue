@@ -6,13 +6,20 @@
       lede="Everything here is stored in a plain JSON file you also own — edit it from this screen, over the REST API, or in a text editor."
     >
       <template #actions>
-        <button class="btn-primary" type="button" :disabled="saving || !model" @click="save">
-          {{ saving ? 'Saving…' : 'Save changes' }}
+        <button
+          class="btn-primary"
+          type="button"
+          :disabled="saving || !model"
+          @click="locked ? requestUnlock() : save()"
+        >
+          {{ locked ? 'Unlock to save' : saving ? 'Saving…' : 'Save changes' }}
         </button>
       </template>
     </PageHeader>
 
-    <div v-if="model" class="space-y-6">
+    <LockBanner what="Settings" />
+
+    <div v-if="model" class="space-y-6" :class="locked && 'pointer-events-none opacity-60'" :aria-disabled="locked">
       <!-- server -->
       <GlassCard data-reveal>
         <h2 class="display mb-1 text-xl text-paper">REST API server</h2>
@@ -100,6 +107,72 @@
         </select>
       </GlassCard>
 
+      <!-- desktop integration -->
+      <GlassCard v-if="installInfo.available" data-reveal>
+        <h2 class="display mb-1 text-xl text-paper">Desktop integration</h2>
+        <p class="mb-5 text-xs leading-relaxed text-paper-mute">
+          You are running the portable file. Installing adds it to your applications menu and makes
+          the <code class="font-mono">posd</code> command available — all in your home directory,
+          no password needed.
+        </p>
+
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div class="min-w-0">
+            <div class="data-label mb-1">Status</div>
+            <div class="truncate font-mono text-xs text-paper-dim">
+              {{ installInfo.installed ? installInfo.installedPath : 'Not installed' }}
+            </div>
+          </div>
+          <button
+            type="button"
+            :class="installInfo.installed ? 'btn-ghost' : 'btn-primary'"
+            :disabled="installBusy"
+            @click="installInfo.installed ? removeApp() : addApp()"
+          >
+            {{ installBusy ? 'Working…' : installInfo.installed ? 'Remove' : 'Install' }}
+          </button>
+        </div>
+
+        <p class="mt-4 text-[0.6875rem] leading-relaxed text-paper-mute">
+          Removing takes back only what was installed. Your settings stay where they are.
+        </p>
+      </GlassCard>
+
+      <!-- security -->
+      <GlassCard data-reveal>
+        <h2 class="display mb-1 text-xl text-paper">Application lock</h2>
+        <p class="mb-5 text-xs leading-relaxed text-paper-mute">
+          Set by the machine administrator, not from here — the password lives in a root-owned file
+          so it cannot be removed with a text editor.
+        </p>
+
+        <dl class="mb-5 grid grid-cols-2 gap-4">
+          <div>
+            <dt class="data-label mb-1">Password</dt>
+            <dd class="text-sm text-paper-dim">{{ auth.status.value.passwordSet ? 'Set' : 'Not set' }}</dd>
+          </div>
+          <div>
+            <dt class="data-label mb-1">Auto-lock</dt>
+            <dd class="text-sm text-paper-dim">
+              {{ auth.status.value.autoLockMinutes > 0 ? `${auth.status.value.autoLockMinutes} min idle` : 'Disabled' }}
+            </dd>
+          </div>
+        </dl>
+
+        <div class="glass-inset space-y-1 px-4 py-3 font-mono text-[0.6875rem] text-paper-mute">
+          <div>sudo posd admin set-password</div>
+          <div>sudo posd admin clear-password</div>
+          <div>sudo posd admin auto-lock 15</div>
+          <div>sudo posd admin status</div>
+          <div class="pt-2 text-paper-dim">AppImage install? prefix with the full path:</div>
+          <div>sudo ~/.local/bin/posd admin status</div>
+        </div>
+
+        <p class="mt-4 text-[0.6875rem] leading-relaxed text-paper-mute">
+          While locked, this screen, provider configuration and the Operations runner are read-only.
+        </p>
+      </GlassCard>
+
       <!-- file location -->
       <GlassCard data-reveal :pad="false" class="px-6 py-4">
         <div class="flex flex-wrap items-center justify-between gap-3">
@@ -127,6 +200,34 @@
 import type { ProviderSummary, Settings } from '~/composables/api'
 
 const api = useApi()
+const auth = useAuth()
+const locked = useLocked()
+const { info: installInfo, install: installApp, uninstall: uninstallApp, refresh: refreshInstall } = useInstall()
+const installBusy = ref(false)
+
+async function addApp() {
+  installBusy.value = true
+  try {
+    await installApp()
+    toast('ok', 'Added to your applications menu')
+  } catch (e) {
+    toast('error', e instanceof Error ? e.message : 'Install failed')
+  } finally {
+    installBusy.value = false
+  }
+}
+
+async function removeApp() {
+  installBusy.value = true
+  try {
+    await uninstallApp()
+    toast('ok', 'Removed from your applications menu')
+  } catch (e) {
+    toast('error', e instanceof Error ? e.message : 'Removal failed')
+  } finally {
+    installBusy.value = false
+  }
+}
 const root = ref<HTMLElement>()
 useReveal(root)
 
@@ -187,5 +288,8 @@ async function save() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  refreshInstall()
+})
 </script>

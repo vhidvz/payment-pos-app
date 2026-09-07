@@ -2,8 +2,9 @@
 name = "payment-pos-app"
 version = "0.1.0"
 description = "Ledger POS — a desktop bridge that exposes payment POS terminals as a local REST API"
-authors = ["Vahid V."]
+authors = ["Vahid V. <vhid.vz@gmail.com>"]
 edition = "2021"
+license = "MIT"
 default-run = "payment-pos-app"
 
 [lib]
@@ -39,6 +40,12 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+argon2 = "0.6"
+rpassword = "7"
+libc = "0.2.189"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "payment-pos-app"

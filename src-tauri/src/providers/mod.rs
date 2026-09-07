@@ -28,6 +28,8 @@ pub enum ProviderError {
     #[error("provider is not configured: {0}")]
     NotConfigured(String),
     #[error("{0}")]
+    Unreachable(String),
+    #[error("{0}")]
     Execution(String),
 }
 
@@ -131,6 +133,48 @@ pub struct FunctionSpec {
     pub example: Option<Value>,
 }
 
+/// Reachability of the physical link to a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkState {
+    /// The terminal accepted a connection.
+    Up,
+    /// The terminal is configured but did not accept a connection.
+    Down,
+    /// Not determined: unconfigured, or the terminal was busy and must not be disturbed.
+    Unknown,
+    /// This provider has no external link (the sandbox simulator).
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStatus {
+    pub state: LinkState,
+    /// What was observed, in one line.
+    pub detail: String,
+    /// What the operator should do about it, when there is something to do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Round trip of the successful probe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+}
+
+impl LinkStatus {
+    pub fn new(state: LinkState, detail: impl Into<String>) -> Self {
+        Self { state, detail: detail.into(), hint: None, latency_ms: None }
+    }
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    pub fn with_latency(mut self, ms: u64) -> Self {
+        self.latency_ms = Some(ms);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
@@ -160,6 +204,15 @@ pub trait Provider: Send + Sync {
     async fn get_config(&self) -> Value;
     async fn set_config(&self, config: Value) -> Result<(), ProviderError>;
     async fn status(&self) -> ProviderStatus;
+    /// Cheap reachability check for the physical link, for a live status light.
+    ///
+    /// Implementations MUST NOT disturb a transaction in progress: this runs on a
+    /// UI poll, and the thing on the other end takes people's money. When the
+    /// terminal is busy or holding a session open, report [`LinkState::Unknown`]
+    /// rather than opening a second connection to it.
+    async fn probe_link(&self) -> LinkStatus {
+        LinkStatus::new(LinkState::NotApplicable, "this provider has no external link")
+    }
     async fn invoke(&self, function: &str, params: Value) -> Result<Value, ProviderError>;
 }
 

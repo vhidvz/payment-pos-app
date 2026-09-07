@@ -33,6 +33,7 @@ fn d_min_gap() -> u64 { 500 }
 fn d_partial_gap() -> u64 { 1500 }
 fn d_first_ack() -> u64 { 3000 }
 fn d_retry_delay() -> u64 { 500 }
+fn d_first_ack_attempts() -> u32 { 3 }
 
 /// Saman SSP1126 provider configuration. Field semantics and defaults mirror
 /// `Ssp1126ClientOptions` in the reference library one-for-one.
@@ -64,8 +65,17 @@ pub struct SamanConfig {
     pub reconnect_gap_after_partial_ms: u64,
     /// Timeout for the opening `15` acknowledgement only. Default 3000.
     pub first_ack_timeout_ms: u64,
-    /// Retry once if the opening request times out on a fresh connection. Default true.
+    /// Master switch for re-sending an unanswered opening request. Default true.
+    /// Kept so existing settings files keep loading; set it false to send once.
     pub retry_on_first_timeout: bool,
+    /// How many times to send the opening request before giving up, including the
+    /// first. Default 3.
+    ///
+    /// The SSP1126 *drops* the opening message on a fresh connection rather than
+    /// answering it slowly — a 20-second wait produced nothing where a re-send
+    /// answered in 3 — so this, not `first_ack_timeout_ms`, is the lever that
+    /// makes a transaction land.
+    pub first_ack_attempts: u32,
     /// Delay before that retry. Default 500.
     pub retry_delay_ms: u64,
     /// Attach the raw hex frame trace to every result (debugging aid). Default false.
@@ -88,6 +98,7 @@ impl Default for SamanConfig {
             reconnect_gap_after_partial_ms: d_partial_gap(),
             first_ack_timeout_ms: d_first_ack(),
             retry_on_first_timeout: d_true(),
+            first_ack_attempts: d_first_ack_attempts(),
             retry_delay_ms: d_retry_delay(),
             include_trace: false,
         }
@@ -151,6 +162,10 @@ pub struct TransactionResult {
     /// its timeout, as opposed to a decline / bad MAC. Only meaningful when `ok` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
+    /// Which processing code actually answered a diagnostic probe. Only set by
+    /// `connection_test`, which has more than one way to reach the terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
     /// Raw POS messages exchanged (hex), when `includeTrace` is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<Vec<String>>,
@@ -455,29 +470,44 @@ impl SamanClient {
     }
 
     /// Send the opening request of a transaction and wait for the first response.
-    /// If nothing comes back AND this was the first send on a freshly-opened
-    /// connection, close, wait `retryDelayMs`, reconnect, and try exactly once more.
+    ///
+    /// The terminal drops this message outright on a freshly opened connection a
+    /// good fraction of the time — measured on an SSP1126, waiting twenty seconds
+    /// produced nothing where re-sending was answered in three. So an unanswered
+    /// opening request is re-sent, up to `first_ack_attempts` times, each on a
+    /// fresh connection. Only a *fresh* connection qualifies: a terminal that
+    /// falls silent part-way through a conversation is a different fault and must
+    /// not be handed the same request again.
     async fn send_and_await_first_ack(
         &mut self,
         req: &mut Iso8583Message,
     ) -> Result<Option<Recv>, ClientError> {
         let timeout_ms = self.cfg.first_ack_timeout_ms;
-        let attempted_on_fresh_connection = self.just_reconnected;
-        self.send(req).await?;
-        let mut r = self.recv(timeout_ms).await?;
-        if r.is_none() && attempted_on_fresh_connection && self.cfg.retry_on_first_timeout {
+        let attempts = if self.cfg.retry_on_first_timeout {
+            self.cfg.first_ack_attempts.max(1)
+        } else {
+            1
+        };
+
+        for attempt in 1..=attempts {
+            let on_fresh_connection = self.just_reconnected;
+            self.send(req).await?;
+            if let Some(r) = self.recv(timeout_ms).await? {
+                return Ok(Some(r));
+            }
+            if attempt == attempts || !on_fresh_connection {
+                break;
+            }
             let delay = self.cfg.retry_delay_ms;
             self.trace_line(format!(
-                "  first response timed out on a fresh connection, retrying after {delay}ms"
+                "  opening request unanswered ({attempt}/{attempts}); re-sending after {delay}ms"
             ));
             self.transport.close();
             self.last_closed_at = Some(Instant::now());
             tokio::time::sleep(Duration::from_millis(delay)).await;
             self.ensure_connected().await?;
-            self.send(req).await?;
-            r = self.recv(timeout_ms).await?;
         }
-        Ok(r)
+        Ok(None)
     }
 
     fn validate(r: &Option<Recv>, proc: Option<&str>, rc: Option<&str>) -> bool {
@@ -634,11 +664,38 @@ impl SamanClient {
     // --------------------------------------------------------- public surface
 
     /// Verify connectivity with the terminal (processing code 410000).
+    ///
+    /// A terminal can stay silent to 410000 while the link is perfectly healthy —
+    /// observed on an SSP1126 (firmware 10.063.00PO) in the minutes after its PC
+    /// link first opened, where 410000 timed out twice in a row and 390000 answered
+    /// normally on the same socket, and where 410000 later answered fine. Since this
+    /// is the check an operator reaches for when something looks wrong, silence is
+    /// retried as the authorized-operations probe rather than reported as a dead
+    /// terminal. `probe` in the result says which one answered.
     pub async fn connection_test(&mut self) -> Result<TransactionResult, ClientError> {
         self.begin_txn();
         let mut result = TransactionResult::default();
         let mut last: Option<Recv> = None;
-        let err = self.connection_test_inner(&mut result, &mut last).await.err();
+        let mut err = self.connection_test_inner(&mut result, &mut last).await.err();
+
+        if result.ok {
+            result.probe = Some("410000".into());
+        } else if err.is_none() && last.is_none() {
+            // No frame came back at all — silence, not a decline. Try the other probe.
+            self.finish().await;
+            self.trace_line("  410000 unanswered; re-checking with 390000".into());
+            result = TransactionResult::default();
+            last = None;
+            err = self
+                .authorized_operations_inner(&mut result, &mut last)
+                .await
+                .map(|_flags| ())
+                .err();
+            if result.ok {
+                result.probe = Some("390000".into());
+            }
+        }
+
         if !result.ok {
             self.finalize_failure(&mut result, &last);
         } else {
@@ -1181,42 +1238,55 @@ impl SamanClient {
     }
 
     /// Query which operations the terminal is provisioned for (processing code 390000).
+    /// The 390000 conversation, shared by `get_authorized_operations` and by
+    /// `connection_test`'s fallback. Returns the raw DE48 flag string.
+    async fn authorized_operations_inner(
+        &mut self,
+        result: &mut TransactionResult,
+        last: &mut Option<Recv>,
+    ) -> Result<String, ClientError> {
+        self.ensure_connected().await?;
+        let mut req = self.base_message("390000");
+        let currency = self.cfg.currency.clone();
+        req.set_str(49, &currency);
+        *last = self.send_and_await_first_ack(&mut req).await?;
+        let mut flags = String::new();
+        if Self::validate(last, None, Some("15")) {
+            let iso = last.as_ref().unwrap().iso.clone();
+            self.harvest(result, &iso, &[(12, None), (13, None), (41, Some(Target::TerminalId))]);
+            *last = self.recv(10_000).await?;
+            if Self::validate(last, Some("390001"), None) {
+                let iso = last.as_ref().unwrap().iso.clone();
+                self.harvest(
+                    result,
+                    &iso,
+                    &[
+                        (39, Some(Target::ResponseCode)),
+                        (46, Some(Target::TransactionDate)),
+                        (48, None),
+                        (57, Some(Target::PosVersion)),
+                    ],
+                );
+                flags = iso.get_str(48).unwrap_or_default();
+                result.ok = true;
+            }
+        }
+        Ok(flags)
+    }
+
     pub async fn get_authorized_operations(&mut self) -> Result<AuthorizedOperations, ClientError> {
         self.begin_txn();
         let mut result = TransactionResult::default();
         let mut last: Option<Recv> = None;
         let mut flags = String::new();
 
-        let err = async {
-            self.ensure_connected().await?;
-            let mut req = self.base_message("390000");
-            let currency = self.cfg.currency.clone();
-            req.set_str(49, &currency);
-            last = self.send_and_await_first_ack(&mut req).await?;
-            if Self::validate(&last, None, Some("15")) {
-                let iso = last.as_ref().unwrap().iso.clone();
-                self.harvest(&mut result, &iso, &[(12, None), (13, None), (41, Some(Target::TerminalId))]);
-                last = self.recv(10_000).await?;
-                if Self::validate(&last, Some("390001"), None) {
-                    let iso = last.as_ref().unwrap().iso.clone();
-                    self.harvest(
-                        &mut result,
-                        &iso,
-                        &[
-                            (39, Some(Target::ResponseCode)),
-                            (46, Some(Target::TransactionDate)),
-                            (48, None),
-                            (57, Some(Target::PosVersion)),
-                        ],
-                    );
-                    flags = iso.get_str(48).unwrap_or_default();
-                    result.ok = true;
-                }
+        let err = match self.authorized_operations_inner(&mut result, &mut last).await {
+            Ok(f) => {
+                flags = f;
+                None
             }
-            Ok::<(), ClientError>(())
-        }
-        .await
-        .err();
+            Err(e) => Some(e),
+        };
 
         if !result.ok {
             self.finalize_failure(&mut result, &last);
@@ -1534,9 +1604,187 @@ fn parse_report_rows(payload: &str, report_type: ReportType) -> Vec<ReportRow> {
     rows
 }
 
+/// The fake terminal, shared with the provider-level tests in `super`.
+#[cfg(test)]
+pub mod tests_support {
+    pub use super::tests::spawn_fake_terminal;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // ------------------------------------------------------- fake terminal
+
+    /// Wrap an ISO message the way the terminal does on the way back:
+    /// 2-byte big-endian length over header+body, then the 5-byte header.
+    fn frame(iso: &[u8]) -> Vec<u8> {
+        let mut out = ((5 + iso.len()) as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(iso);
+        out
+    }
+
+    fn msg(pairs: &[(u16, &str)]) -> Vec<u8> {
+        let mut m = Iso8583Message::new();
+        m.set_mti(MTI);
+        for (de, v) in pairs {
+            m.set_str(*de, v);
+        }
+        m.pack_with_mac().expect("pack")
+    }
+
+    /// A stand-in SSP1126 speaking the real framing over a real socket.
+    /// Processing codes listed in `mute` are accepted and then ignored, reproducing
+    /// a terminal that stays silent to one probe while the link is otherwise fine.
+    pub async fn spawn_fake_terminal(mute: &'static [&'static str]) -> u16 {
+        spawn_counting_terminal(mute).await.0
+    }
+
+    /// Same, but counts how many times a muted processing code reaches it — the
+    /// terminal drops first messages, so the number of sends is what we measure.
+    pub async fn spawn_counting_terminal(
+        mute: &'static [&'static str],
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = spawn_terminal_inner(mute, sends.clone()).await;
+        (port, sends)
+    }
+
+    async fn spawn_terminal_inner(
+        mute: &'static [&'static str],
+        sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let sends = sends.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let Ok(req) = Iso8583Message::unpack(&buf[..n]) else { continue };
+                        let proc = req.get_str(3).unwrap_or_default();
+                        if mute.contains(&proc.as_str()) {
+                            sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+                        let replies: Vec<Vec<u8>> = match proc.as_str() {
+                            "410000" => vec![
+                                msg(&[(3, "410000"), (39, "15"), (41, "15527222")]),
+                                msg(&[(3, "410003"), (39, "00")]),
+                            ],
+                            // The PC acknowledges the result; the terminal ends the
+                            // conversation with 17.
+                            "000004" => vec![msg(&[(3, "000004"), (39, "17")])],
+                            "390000" => vec![
+                                msg(&[(3, "390000"), (39, "15"), (41, "15527222")]),
+                                msg(&[
+                                    (3, "390001"),
+                                    (39, "00"),
+                                    (48, "1*1*1*1*1*1*1*1*1*"),
+                                    (57, "10.063.00PO"),
+                                ]),
+                            ],
+                            _ => vec![], // dispose and anything else: silence
+                        };
+                        for r in replies {
+                            if sock.write_all(&frame(&r)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// Real timings would make these tests take tens of seconds.
+    fn fast_config(port: u16) -> SamanConfig {
+        SamanConfig {
+            host: "127.0.0.1".into(),
+            port,
+            first_ack_timeout_ms: 250,
+            retry_delay_ms: 10,
+            min_reconnect_gap_ms: 0,
+            reconnect_gap_after_partial_ms: 0,
+            include_trace: true,
+            ..SamanConfig::default()
+        }
+    }
+
+    /// Measured on the real terminal: it drops the first message on a fresh
+    /// connection often enough that one retry is not enough — both attempts were
+    /// lost about one run in three. Waiting longer never helped (20s produced
+    /// nothing at all), so the send count is the only lever that works.
+    #[tokio::test]
+    async fn a_dropped_first_message_is_retried_up_to_the_configured_count() {
+        let (port, sends) = spawn_counting_terminal(&["390000"]).await;
+        let mut cfg = fast_config(port);
+        cfg.first_ack_attempts = 3;
+        let mut c = SamanClient::new(cfg);
+
+        let _ = c.get_authorized_operations().await;
+
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// One attempt means one message — nothing is re-sent behind the operator's back.
+    #[tokio::test]
+    async fn a_single_attempt_sends_the_message_once() {
+        let (port, sends) = spawn_counting_terminal(&["390000"]).await;
+        let mut cfg = fast_config(port);
+        cfg.first_ack_attempts = 1;
+        let mut c = SamanClient::new(cfg);
+
+        let _ = c.get_authorized_operations().await;
+
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_test_reports_which_probe_answered() {
+        let port = spawn_fake_terminal(&[]).await;
+        let mut c = SamanClient::new(fast_config(port));
+
+        let r = c.connection_test().await.expect("transport must not error");
+
+        assert!(r.ok, "410000 was answered, so the test should pass: {r:?}");
+        assert_eq!(r.probe.as_deref(), Some("410000"));
+    }
+
+    /// A terminal that ignores 410000 while answering everything else must not be
+    /// reported as dead by the one button an operator presses to check it.
+    #[tokio::test]
+    async fn connection_test_falls_back_when_410000_is_unanswered() {
+        let port = spawn_fake_terminal(&["410000"]).await;
+        let mut c = SamanClient::new(fast_config(port));
+
+        let r = c.connection_test().await.expect("transport must not error");
+
+        assert!(r.ok, "the fallback probe should have succeeded: {r:?}");
+        assert_eq!(r.probe.as_deref(), Some("390000"));
+        assert_eq!(r.terminal_id.as_deref(), Some("15527222"));
+    }
+
+    /// A terminal that answers nothing at all is still a failure.
+    #[tokio::test]
+    async fn connection_test_fails_when_no_probe_is_answered() {
+        let port = spawn_fake_terminal(&["410000", "390000"]).await;
+        let mut c = SamanClient::new(fast_config(port));
+
+        let r = c.connection_test().await.expect("transport must not error");
+
+        assert!(!r.ok, "nothing answered, so it must not report success: {r:?}");
+        assert_eq!(r.timed_out, Some(true));
+    }
 
     #[test]
     fn print_data_packing_matches_reference() {

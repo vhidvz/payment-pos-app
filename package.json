@@ -1,6 +1,9 @@
 {
   "name": "payment-pos-app",
   "version": "0.1.0",
+  "description": "Ledger POS — a desktop bridge that exposes payment POS terminals as a local REST API",
+  "author": "Vahid V. <vhid.vz@gmail.com>",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
@@ -26,5 +29,15 @@
     "@tailwindcss/vite": "^4",
     "@tauri-apps/cli": "^2",
     "tailwindcss": "^4"
-  }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "engines": {
+    "node": ">=22.x.x <23",
+    "pnpm": ">=10.5.2"
+  },
+  "packageManager": "pnpm@10.5.2"
 }

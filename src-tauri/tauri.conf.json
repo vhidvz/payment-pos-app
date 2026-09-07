@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "identifier": "io.vhidvz.ledgerpos",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "pnpm dev",
     "devUrl": "http://127.0.0.1:14373",
-    "beforeBuildCommand": "npm run generate",
+    "beforeBuildCommand": "pnpm generate",
+    "beforeBundleCommand": "node scripts/prepare-appimage-plugin.mjs",
     "frontendDist": "../.output/public"
   },
   "app": {

@@ -67,6 +67,9 @@ pub struct AppBehaviorSettings {
     pub start_at_boot: bool,
     /// Start with the window hidden (tray only).
     pub start_minimized: bool,
+    /// Set once the desktop-integration offer has been answered, so an AppImage
+    /// run that the user chose not to integrate does not ask again at every launch.
+    pub install_prompt_dismissed: bool,
 }
 
 impl Default for AppBehaviorSettings {
@@ -75,6 +78,7 @@ impl Default for AppBehaviorSettings {
             minimize_to_tray_on_close: d_true(),
             start_at_boot: false,
             start_minimized: false,
+            install_prompt_dismissed: false,
         }
     }
 }
@@ -143,7 +147,12 @@ pub struct SettingsStore {
 impl SettingsStore {
     /// Load settings from disk (writing defaults on first run or unreadable file).
     pub fn load() -> Self {
-        let path = settings_path();
+        Self::at(settings_path())
+    }
+
+    /// Same, for an explicit path — the seam tests use so they never touch the
+    /// real configuration file.
+    pub fn at(path: PathBuf) -> Self {
         let settings = match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
                 Ok(s) => s,

@@ -6,6 +6,8 @@
       lede="Pick a provider and a function; the form below is generated from its live parameter spec — the same contract the REST API publishes."
     />
 
+    <LockBanner what="Manual terminal operations" />
+
     <div class="grid items-start gap-6 lg:grid-cols-[300px_1fr]">
       <!-- picker column -->
       <div class="space-y-4" data-reveal>
@@ -45,7 +47,11 @@
           </div>
           <p class="mb-5 max-w-[64ch] text-sm leading-relaxed text-paper-dim">{{ selectedFn.description }}</p>
 
-          <FnForm :fn="selectedFn" :busy="busy" @invoke="run" />
+          <FnForm :fn="selectedFn" :busy="busy || locked" @invoke="run" />
+
+          <p v-if="locked" class="mt-4 rounded-lg border border-warn/25 bg-warn/6 px-3 py-2 text-xs leading-relaxed text-warn">
+            Running functions by hand is locked. Unlock to continue.
+          </p>
         </GlassCard>
 
         <div v-if="lastResult && selectedFn" aria-live="polite">
@@ -73,6 +79,7 @@ import type { FunctionSpec, ProviderSummary } from '~/composables/api'
 import { ApiError } from '~/composables/api'
 
 const api = useApi()
+const locked = useLocked()
 const route = useRoute()
 const router = useRouter()
 const root = ref<HTMLElement>()
@@ -141,6 +148,12 @@ watch(selectedProvider, () => {
 
 async function run(params: Record<string, unknown>) {
   if (!selectedFn.value) return
+  // A UI gate, not a security boundary: the same call over the REST API stays
+  // open on purpose so the till keeps working while the app is locked.
+  if (locked.value) {
+    requestUnlock()
+    return
+  }
   busy.value = true
   lastError.value = null
   lastResult.value = null

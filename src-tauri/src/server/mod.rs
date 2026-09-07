@@ -15,6 +15,7 @@ use utoipa::ToSchema;
 
 use crate::activity::ActivityLog;
 use crate::providers::ProviderRegistry;
+use crate::security::AuthState;
 use crate::settings::{ServerSettings, SettingsStore};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -43,16 +44,23 @@ impl Default for ServerStatus {
 pub struct AppState {
     pub settings: Arc<SettingsStore>,
     pub registry: Arc<ProviderRegistry>,
+    /// Lock state: the administrator's password file plus live sessions.
+    pub auth: Arc<AuthState>,
     pub activity: Arc<ActivityLog>,
     pub started_at: std::time::Instant,
     pub server_status: Arc<RwLock<ServerStatus>>,
 }
 
 impl AppState {
-    pub fn new(settings: Arc<SettingsStore>, registry: Arc<ProviderRegistry>) -> Self {
+    pub fn new(
+        settings: Arc<SettingsStore>,
+        registry: Arc<ProviderRegistry>,
+        auth: Arc<AuthState>,
+    ) -> Self {
         Self {
             settings,
             registry,
+            auth,
             activity: Arc::new(ActivityLog::default()),
             started_at: std::time::Instant::now(),
             server_status: Arc::new(RwLock::new(ServerStatus::default())),

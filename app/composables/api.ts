@@ -58,6 +58,14 @@ export interface ProviderSummary extends ProviderMeta {
   functionCount: number
 }
 
+/** Reachability of the physical link to a terminal. */
+export interface LinkStatus {
+  state: 'up' | 'down' | 'unknown' | 'notApplicable'
+  detail: string
+  hint?: string
+  latencyMs?: number
+}
+
 export interface ProviderDetail {
   metadata: ProviderMeta
   active: boolean
@@ -96,6 +104,12 @@ export interface ActivityEntry {
   summary?: string
   durationMs: number
   error?: string
+}
+
+export interface AuthStatus {
+  passwordSet: boolean
+  locked: boolean
+  autoLockMinutes: number
 }
 
 export interface SystemInfo {
@@ -140,6 +154,14 @@ async function fetchServerInfoFromShell(): Promise<{ baseUrl: string; docsUrl: s
 
 export const useApiBase = () => useState<string>('api-base', () => FALLBACK_BASE)
 
+/**
+ * Session token from `POST /api/v1/auth/unlock`.
+ *
+ * Deliberately in memory only: reloading the window re-locks the UI, and the
+ * token never survives on disk where another user of this machine could read it.
+ */
+export const useAuthToken = () => useState<string | null>('auth-token', () => null)
+
 export async function resolveApiBase(): Promise<string> {
   const base = useApiBase()
   const info = await fetchServerInfoFromShell()
@@ -151,11 +173,15 @@ export async function resolveApiBase(): Promise<string> {
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const base = useApiBase().value
+  const token = useAuthToken()
+  const headers: Record<string, string> = {}
+  if (body !== undefined) headers['content-type'] = 'application/json'
+  if (token.value) headers.authorization = `Bearer ${token.value}`
   let res: Response
   try {
     res = await fetch(`${base}${path}`, {
       method,
-      headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     })
   } catch {
@@ -170,6 +196,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
   if (!res.ok) {
     const err = data as { code?: string; error?: string } | null
+    // The session expired or was revoked elsewhere — stop presenting a dead token.
+    if (err?.code === 'locked') token.value = null
     throw new ApiError(res.status, err?.code ?? 'http_error', err?.error ?? `HTTP ${res.status}`)
   }
   return data as T
@@ -188,6 +216,7 @@ export function useApi() {
       request<{ settings: Settings; serverRestarting: boolean }>('PUT', '/api/v1/settings', s),
     providers: () => request<ProviderSummary[]>('GET', '/api/v1/providers'),
     provider: (id: string) => request<ProviderDetail>('GET', `/api/v1/providers/${encodeURIComponent(id)}`),
+    link: (id: string) => request<LinkStatus>('GET', `/api/v1/providers/${encodeURIComponent(id)}/link`),
     setActive: (id: string) => request<ProviderDetail>('PUT', '/api/v1/providers/active', { id }),
     saveProviderConfig: (id: string, config: Record<string, unknown>) =>
       request<Record<string, unknown>>('PUT', `/api/v1/providers/${encodeURIComponent(id)}/config`, config),
@@ -198,6 +227,11 @@ export function useApi() {
         params,
       ),
     activity: (limit = 50) => request<ActivityEntry[]>('GET', `/api/v1/activity?limit=${limit}`),
+
+    authStatus: () => request<AuthStatus>('GET', '/api/v1/auth/status'),
+    unlock: (password: string) =>
+      request<{ token: string; autoLockMinutes: number }>('POST', '/api/v1/auth/unlock', { password }),
+    lockApp: () => request<{ ok: boolean }>('POST', '/api/v1/auth/lock'),
   }
 }
 

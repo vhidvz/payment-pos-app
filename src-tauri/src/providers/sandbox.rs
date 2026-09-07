@@ -452,3 +452,16 @@ impl Provider for SandboxProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod sandbox_link_tests {
+    use super::*;
+    use crate::providers::LinkState;
+
+    /// The simulator has no wire to be up or down on.
+    #[tokio::test]
+    async fn link_probe_is_not_applicable() {
+        let status = SandboxProvider::new(Value::Null).probe_link().await;
+        assert_eq!(status.state, LinkState::NotApplicable, "detail: {}", status.detail);
+    }
+}

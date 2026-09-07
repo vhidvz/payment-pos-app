@@ -45,8 +45,8 @@
         </button>
       </nav>
 
-      <!-- server status -->
-      <div class="px-5 pb-5">
+      <!-- server + terminal status -->
+      <div class="space-y-2 px-5 pb-5">
         <div class="glass-inset flex items-center gap-2.5 px-3.5 py-3">
           <span class="dot" :class="serverUp ? 'text-ok bg-ok' : 'text-danger bg-danger'" />
           <div class="min-w-0 leading-tight">
@@ -56,6 +56,21 @@
             <div class="truncate font-mono text-[0.6875rem] text-paper-mute tabular">{{ baseHost }}</div>
           </div>
         </div>
+
+        <NuxtLink
+          v-if="link && link.state !== 'notApplicable'"
+          :to="`/providers/${activeProvider}`"
+          class="glass-inset flex items-center gap-2.5 px-3.5 py-3 transition-colors hover:bg-white/4"
+          :title="link.detail"
+        >
+          <span class="dot" :class="terminalDot" />
+          <div class="min-w-0 leading-tight">
+            <div class="text-xs font-medium" :class="link.state === 'down' ? 'text-danger' : 'text-paper-dim'">
+              {{ terminalLabel }}
+            </div>
+            <div class="truncate font-mono text-[0.6875rem] text-paper-mute">{{ activeProvider }}</div>
+          </div>
+        </NuxtLink>
       </div>
     </aside>
 
@@ -65,6 +80,27 @@
         <slot />
       </div>
     </main>
+
+    <!-- lock control: pinned top-right, icon only, hidden when no password is set -->
+    <button
+      v-if="auth.status.value.passwordSet"
+      class="lock-pin"
+      :class="locked && 'lock-pin-locked'"
+      type="button"
+      :title="locked ? 'Unlock to make changes' : 'Lock the app'"
+      :aria-label="locked ? 'Unlock to make changes' : 'Lock the app'"
+      @click="locked ? requestUnlock() : lockNow()"
+    >
+      <svg v-if="locked" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
+      </svg>
+      <svg v-else width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 9.9-1" />
+      </svg>
+    </button>
+
+    <InstallWizard />
+    <UnlockDialog />
 
     <!-- ---------------------------------------------------------- toasts -->
     <div class="pointer-events-none fixed right-5 bottom-5 z-50 flex w-[320px] flex-col gap-2" aria-live="polite">
@@ -94,6 +130,23 @@ const base = useApiBase()
 const serverUp = ref(false)
 const baseHost = computed(() => base.value.replace(/^https?:\/\//, ''))
 
+const activeProvider = ref('')
+const { status: link } = useProviderLink(activeProvider)
+const terminalDot = computed(() =>
+  link.value?.state === 'up'
+    ? 'text-ok bg-ok'
+    : link.value?.state === 'down'
+      ? 'text-danger bg-danger'
+      : 'text-paper-mute bg-paper-mute',
+)
+const terminalLabel = computed(() =>
+  link.value?.state === 'up'
+    ? 'Terminal reachable'
+    : link.value?.state === 'down'
+      ? 'Terminal unreachable'
+      : 'Terminal state unknown',
+)
+
 const nav = [
   {
     to: '/',
@@ -122,12 +175,48 @@ function isActive(to: string) {
   return route.path.startsWith(to)
 }
 
+// ------------------------------------------------------------ application lock
+
+const auth = useAuth()
+const locked = useLocked()
+const { refresh: refreshInstall } = useInstall()
+
+async function lockNow() {
+  await auth.lock()
+  toast('info', 'Locked')
+}
+
+/**
+ * Client-side idle auto-lock. The server is authoritative — it rejects a token
+ * idle past the window regardless — but locking the UI proactively means an
+ * unattended desk does not sit there looking unlocked.
+ */
+let lastActivity = Date.now()
+const noteActivity = () => {
+  lastActivity = Date.now()
+}
+const ACTIVITY_EVENTS = ['pointerdown', 'keydown', 'wheel'] as const
+
+async function checkIdle() {
+  const minutes = auth.status.value.autoLockMinutes
+  if (minutes <= 0 || locked.value || !auth.status.value.passwordSet) return
+  if (Date.now() - lastActivity >= minutes * 60_000) {
+    await auth.lock()
+    toast('info', 'Locked after inactivity')
+  }
+}
+
 let timer: ReturnType<typeof setInterval> | undefined
+let idleTimer: ReturnType<typeof setInterval> | undefined
 
 async function poll() {
   try {
     await api.health()
     serverUp.value = true
+    // The active provider can change from Settings or over the API.
+    activeProvider.value = (await api.system()).activeProvider
+    // The administrator can set or clear the password while the app is running.
+    await auth.refresh()
   } catch {
     serverUp.value = false
     // The shell may have rebound to a new port — re-resolve.
@@ -137,9 +226,17 @@ async function poll() {
 
 onMounted(() => {
   poll()
+  // Asked once per machine: only from an AppImage, only while not yet installed.
+  refreshInstall()
   timer = setInterval(poll, 5000)
+  idleTimer = setInterval(checkIdle, 15_000)
+  ACTIVITY_EVENTS.forEach((e) => window.addEventListener(e, noteActivity, { passive: true }))
 })
-onBeforeUnmount(() => clearInterval(timer))
+onBeforeUnmount(() => {
+  clearInterval(timer)
+  clearInterval(idleTimer)
+  ACTIVITY_EVENTS.forEach((e) => window.removeEventListener(e, noteActivity))
+})
 </script>
 
 <style scoped>
@@ -163,6 +260,34 @@ onBeforeUnmount(() => clearInterval(timer))
   color: var(--color-brass-300);
   background: linear-gradient(90deg, rgb(201 160 85 / 0.12), rgb(201 160 85 / 0.03));
   box-shadow: inset 2px 0 0 var(--color-brass-500);
+}
+
+.lock-pin {
+  position: fixed;
+  top: 1.15rem;
+  right: 1.35rem;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 9999px;
+  border: 1px solid var(--color-line-bright, rgb(255 255 255 / 0.1));
+  background: rgb(20 20 24 / 0.55);
+  backdrop-filter: blur(10px);
+  color: var(--color-paper-mute);
+  cursor: pointer;
+  transition: color 0.2s, background 0.2s, border-color 0.2s;
+}
+.lock-pin:hover {
+  color: var(--color-paper);
+  background: rgb(255 255 255 / 0.07);
+}
+.lock-pin-locked {
+  color: var(--color-brass-300);
+  border-color: rgb(201 160 85 / 0.35);
+  background: rgb(201 160 85 / 0.1);
 }
 
 .toast-enter-active,

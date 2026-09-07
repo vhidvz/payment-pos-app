@@ -6,7 +6,9 @@
 //! start-at-boot syncing, single-instance focus, and a couple of UI commands.
 
 pub mod activity;
+pub mod install;
 pub mod providers;
+pub mod security;
 pub mod server;
 pub mod settings;
 
@@ -23,6 +25,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::providers::{saman::SamanProvider, sandbox::SandboxProvider, ProviderRegistry};
 use crate::server::AppState;
+use crate::security::AuthState;
 use crate::settings::SettingsStore;
 
 pub fn init_tracing() {
@@ -49,7 +52,70 @@ pub fn build_state() -> AppState {
         Arc::new(SamanProvider::new(cfg(providers::saman::PROVIDER_ID))),
         Arc::new(SandboxProvider::new(cfg(providers::sandbox::PROVIDER_ID))),
     ]));
-    AppState::new(settings, registry)
+    let auth = Arc::new(AuthState::new(crate::security::admin_path()));
+    AppState::new(settings, registry, auth)
+}
+
+// --------------------------------------------------------- desktop install
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct InstallInfo {
+    /// True only when this run can integrate itself — i.e. it is an AppImage.
+    /// A packaged install has nothing to do here.
+    available: bool,
+    installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_path: Option<String>,
+    /// The offer has already been answered once.
+    prompt_dismissed: bool,
+}
+
+fn install_info(state: &AppState) -> InstallInfo {
+    let layout = install::Layout::current();
+    InstallInfo {
+        available: install::Source::detect().is_some(),
+        installed: install::is_installed(&layout),
+        installed_path: install::is_installed(&layout)
+            .then(|| layout.app_path().display().to_string()),
+        prompt_dismissed: state.settings.get().app.install_prompt_dismissed,
+    }
+}
+
+#[tauri::command]
+fn install_status(state: tauri::State<'_, AppState>) -> InstallInfo {
+    install_info(&state)
+}
+
+#[tauri::command]
+fn install_app(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<InstallInfo, String> {
+    let source = install::Source::detect()
+        .ok_or("this build is not an AppImage, so there is nothing to integrate")?;
+    let layout = install::Layout::current();
+    install::install(&layout, &source)?;
+    let _ = state.settings.update(|s| s.app.install_prompt_dismissed = true);
+    // An autostart entry written before the install still points at wherever the
+    // AppImage was downloaded; move it to the copy that is now permanent.
+    if state.settings.get().app.start_at_boot {
+        sync_autostart(&app, true);
+    }
+    Ok(install_info(&state))
+}
+
+#[tauri::command]
+fn uninstall_app(state: tauri::State<'_, AppState>) -> Result<InstallInfo, String> {
+    install::uninstall(&install::Layout::current())?;
+    Ok(install_info(&state))
+}
+
+/// Remember that the offer was declined, so it is made once and not again.
+#[tauri::command]
+fn dismiss_install_prompt(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .settings
+        .update(|s| s.app.install_prompt_dismissed = true)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ------------------------------------------------------------- UI commands
@@ -237,7 +303,79 @@ fn tune_webview_env() {
 #[cfg(not(target_os = "linux"))]
 fn tune_webview_env() {}
 
+/// `--install` / `--uninstall` / `--install-status`, handled before the GUI
+/// starts so the same binary can be driven from a provisioning script.
+/// Returns true when the process has done its job and should exit.
+fn handle_install_cli() -> bool {
+    let arg = std::env::args().nth(1);
+    let layout = install::Layout::current();
+    match arg.as_deref() {
+        Some("--install") => {
+            match install::Source::detect() {
+                None => {
+                    eprintln!(
+                        "--install only applies to the AppImage build; this copy was started another way."
+                    );
+                    std::process::exit(2);
+                }
+                Some(source) => match install::install(&layout, &source) {
+                    Ok(report) => {
+                        println!("Installed Ledger POS for {}:", whoami());
+                        for p in report.written {
+                            println!("  {}", p.display());
+                        }
+                        println!(
+                            "\nLauncher: your application menu. Administrator commands: posd admin status"
+                        );
+                        println!(
+                            "If `posd` is not found, add ~/.local/bin to your PATH."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("install failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            }
+            true
+        }
+        Some("--uninstall") => {
+            match install::uninstall(&layout) {
+                Ok(report) if report.removed.is_empty() => println!("Nothing was installed."),
+                Ok(report) => {
+                    println!("Removed:");
+                    for p in report.removed {
+                        println!("  {}", p.display());
+                    }
+                    println!("\nYour settings and the administrator file were left untouched.");
+                }
+                Err(e) => {
+                    eprintln!("uninstall failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            true
+        }
+        Some("--install-status") => {
+            println!("appimage   : {}", install::Source::detect().is_some());
+            println!("installed  : {}", install::is_installed(&layout));
+            println!("app        : {}", layout.app_path().display());
+            println!("desktop    : {}", layout.desktop_path().display());
+            println!("posd       : {}", layout.posd_path().display());
+            true
+        }
+        _ => false,
+    }
+}
+
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "this user".into())
+}
+
 pub fn run() {
+    if handle_install_cli() {
+        return;
+    }
     init_tracing();
     tune_webview_env();
     let state = build_state();
@@ -254,7 +392,14 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .manage(state.clone())
-        .invoke_handler(tauri::generate_handler![server_info, open_docs])
+        .invoke_handler(tauri::generate_handler![
+            server_info,
+            open_docs,
+            install_status,
+            install_app,
+            uninstall_app,
+            dismiss_install_prompt
+        ])
         .setup(move |app| {
             // REST API — runs for the app's whole life, window shown or not.
             tauri::async_runtime::spawn(server::run_server(state.clone()));
