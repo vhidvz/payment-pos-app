@@ -23,6 +23,24 @@
           <div class="display text-[1.05rem] text-paper">Ledger</div>
           <div class="text-[0.625rem] uppercase tracking-[0.3em] text-paper-mute">POS Bridge</div>
         </div>
+
+        <!-- lock control: beside the brand, icon only, hidden when no password is set -->
+        <button
+          v-if="auth.status.value.passwordSet"
+          class="lock-pin ml-auto"
+          :class="locked && 'lock-pin-locked'"
+          type="button"
+          :title="locked ? 'Unlock to make changes' : 'Lock the app'"
+          :aria-label="locked ? 'Unlock to make changes' : 'Lock the app'"
+          @click="locked ? requestUnlock() : lockNow()"
+        >
+          <svg v-if="locked" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
+          </svg>
+          <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 9.9-1" />
+          </svg>
+        </button>
       </div>
 
       <!-- nav -->
@@ -80,24 +98,6 @@
         <slot />
       </div>
     </main>
-
-    <!-- lock control: pinned top-right, icon only, hidden when no password is set -->
-    <button
-      v-if="auth.status.value.passwordSet"
-      class="lock-pin"
-      :class="locked && 'lock-pin-locked'"
-      type="button"
-      :title="locked ? 'Unlock to make changes' : 'Lock the app'"
-      :aria-label="locked ? 'Unlock to make changes' : 'Lock the app'"
-      @click="locked ? requestUnlock() : lockNow()"
-    >
-      <svg v-if="locked" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
-      </svg>
-      <svg v-else width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 9.9-1" />
-      </svg>
-    </button>
 
     <InstallWizard />
     <UnlockDialog />
@@ -263,15 +263,12 @@ onBeforeUnmount(() => {
 }
 
 .lock-pin {
-  position: fixed;
-  top: 1.15rem;
-  right: 1.35rem;
-  z-index: 40;
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: center;
-  width: 2.25rem;
-  height: 2.25rem;
+  width: 2rem;
+  height: 2rem;
   border-radius: 9999px;
   border: 1px solid var(--color-line-bright, rgb(255 255 255 / 0.1));
   background: rgb(20 20 24 / 0.55);

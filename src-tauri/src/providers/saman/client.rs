@@ -321,9 +321,22 @@ struct Recv {
     mac_ok: bool,
 }
 
+/// What the last *real* connection attempt saw. Recorded so the UI can show a
+/// link light without ever opening a connection of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkObservation {
+    Reachable,
+    /// The terminal answered on the network but refused the port.
+    Refused,
+    /// No answer at all: powered off, wrong address, or off the network.
+    Unreachable,
+}
+
 pub struct SamanClient {
     cfg: SamanConfig,
     transport: Box<dyn Transport>,
+    /// Outcome of the most recent connection attempt, and when it happened.
+    last_link: Option<(Instant, LinkObservation)>,
     terminal_id: String,
     last_closed_at: Option<Instant>,
     just_reconnected: bool,
@@ -386,6 +399,7 @@ impl SamanClient {
         Self {
             cfg,
             transport: Box::new(NullTransport),
+            last_link: None,
             terminal_id: String::new(),
             last_closed_at: None,
             just_reconnected: false,
@@ -401,6 +415,12 @@ impl SamanClient {
 
     pub fn is_connected(&self) -> bool {
         self.transport.connected()
+    }
+
+    /// What the last real connection attempt saw, and how long ago.
+    /// `None` when nothing has been attempted yet.
+    pub fn last_link(&self) -> Option<(Duration, LinkObservation)> {
+        self.last_link.map(|(at, o)| (at.elapsed(), o))
     }
 
     // ------------------------------------------------------------- low level
@@ -432,7 +452,18 @@ impl SamanClient {
                 }
             }
             self.transport = make_transport(&self.cfg)?;
-            self.transport.connect().await?;
+            // Every real connection doubles as the link probe, so the status light
+            // costs nothing and can never disturb a transaction.
+            let outcome = self.transport.connect().await;
+            self.last_link = Some((
+                Instant::now(),
+                match &outcome {
+                    Ok(()) => LinkObservation::Reachable,
+                    Err(TransportError::ConnectionRefused { .. }) => LinkObservation::Refused,
+                    Err(_) => LinkObservation::Unreachable,
+                },
+            ));
+            outcome?;
             self.just_reconnected = true;
         } else {
             self.just_reconnected = false;

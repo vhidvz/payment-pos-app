@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use self::client::{config_problem, PrintData, SamanClient, SamanConfig};
+use self::client::{config_problem, LinkObservation, PrintData, SamanClient, SamanConfig};
 use super::{
     terminal_function_specs, FunctionSpec, LinkState, LinkStatus, Provider, ProviderError,
     ProviderMetadata, ProviderStatus,
@@ -31,26 +31,13 @@ const PC_LINK_HINT: &str = "After powering the terminal on, run one card action 
      (you may cancel it) to start its payment application — the terminal keeps its PC link \
      closed until then, and open afterwards.";
 
-/// Longest a status-light probe may block. The configured connect timeout can be
-/// tens of seconds, which is right for a transaction and wrong for a UI poll.
-const LINK_PROBE_CAP: Duration = Duration::from_secs(2);
-
-async fn probe_tcp(host: &str, port: u16, timeout: Duration) -> LinkStatus {
-    let addr = format!("{host}:{port}");
-    let started = std::time::Instant::now();
-    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-        Ok(Ok(_stream)) => LinkStatus::new(LinkState::Up, format!("{addr} accepted a connection"))
-            .with_latency(started.elapsed().as_millis() as u64),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            LinkStatus::new(LinkState::Down, format!("{addr} refused the connection"))
-                .with_hint(PC_LINK_HINT)
-        }
-        Ok(Err(e)) => LinkStatus::new(LinkState::Down, format!("{addr}: {e}")),
-        Err(_) => LinkStatus::new(
-            LinkState::Down,
-            format!("{addr} did not answer within {}ms", timeout.as_millis()),
-        )
-        .with_hint("Check that the terminal is powered on and reachable on this network."),
+/// "12s ago" / "4m ago" — the light says how fresh the reading is.
+fn ago(age: Duration) -> String {
+    let secs = age.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        _ => format!("{}h ago", secs / 3600),
     }
 }
 
@@ -320,7 +307,6 @@ impl Provider for SamanProvider {
     }
 
     async fn probe_link(&self) -> LinkStatus {
-        // Never open a second socket to a terminal that is mid-transaction.
         let Ok(client) = self.client.try_lock() else {
             return LinkStatus::new(
                 LinkState::Unknown,
@@ -333,19 +319,28 @@ impl Provider for SamanProvider {
         if let Some(problem) = config_problem(client.config()) {
             return LinkStatus::new(LinkState::Unknown, problem);
         }
-        let cfg = client.config().clone();
-        drop(client);
-
-        if cfg.transport == "tcp" {
-            let timeout = LINK_PROBE_CAP.min(Duration::from_millis(cfg.connect_timeout_ms));
-            probe_tcp(&cfg.host, cfg.port, timeout).await
-        } else {
-            // Opening the serial device just to look would seize it from the
-            // terminal conversation; a real transaction is the only honest probe.
-            LinkStatus::new(
+        // Report only what real traffic already observed. Opening a socket of our
+        // own would compete with the till for a terminal that wants a measured gap
+        // between connections.
+        match client.last_link() {
+            None => LinkStatus::new(
                 LinkState::Unknown,
-                "serial links are not probed — opening the port could disturb the terminal",
+                "no transaction has reached the terminal yet",
+            ),
+            Some((age, LinkObservation::Reachable)) => LinkStatus::new(
+                LinkState::Up,
+                format!("connected {} — last transaction", ago(age)),
+            ),
+            Some((age, LinkObservation::Refused)) => LinkStatus::new(
+                LinkState::Down,
+                format!("connection refused {}", ago(age)),
             )
+            .with_hint(PC_LINK_HINT),
+            Some((age, LinkObservation::Unreachable)) => LinkStatus::new(
+                LinkState::Down,
+                format!("no answer {}", ago(age)),
+            )
+            .with_hint("Check that the terminal is powered on and reachable on this network."),
         }
     }
 
@@ -609,49 +604,91 @@ mod tests {
     // ------------------------------------------------------------ link probe
 
     fn tcp_provider(port: u16) -> SamanProvider {
-        SamanProvider::new(json!({ "transport": "tcp", "host": "127.0.0.1", "port": port }))
+        SamanProvider::new(json!({
+            "transport": "tcp", "host": "127.0.0.1", "port": port,
+            "firstAckTimeoutMs": 200, "firstAckAttempts": 1,
+            "minReconnectGapMs": 0, "reconnectGapAfterPartialMs": 0
+        }))
     }
 
-    #[tokio::test]
-    async fn link_probe_reports_up_when_the_terminal_accepts_connections() {
+    /// Counts how many connections a port receives, so a test can prove that
+    /// nothing connected at all.
+    async fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        let status = tcp_provider(port).probe_link().await;
-
-        assert_eq!(status.state, LinkState::Up, "detail: {}", status.detail);
-        assert!(status.latency_ms.is_some(), "an up link should be timed");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = accepts.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (port, accepts)
     }
 
+    /// **The status light must never touch the terminal.**
+    ///
+    /// It used to open a TCP connection on every poll. Measured against real
+    /// hardware, that turned a 1.5-second transaction into a 21-second one on
+    /// three runs out of eight: the terminal wants a measured gap between
+    /// connections, and a light that ignores that competes with the till. The
+    /// link state is now whatever the last *real* connection observed.
     #[tokio::test]
-    async fn link_probe_reports_down_with_the_card_hint_when_refused() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+    async fn the_link_probe_never_opens_a_connection() {
+        let (port, accepts) = counting_listener().await;
+        let provider = tcp_provider(port);
 
-        let status = tcp_provider(port).probe_link().await;
+        for _ in 0..5 {
+            provider.probe_link().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(status.state, LinkState::Down, "detail: {}", status.detail);
-        let hint = status.hint.expect("a refused link must explain what to do");
-        assert!(hint.contains("card"), "hint should mention the card action: {hint}");
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the status light connected to the terminal"
+        );
     }
 
-    /// Nothing to probe until someone fills in the address.
+    /// Nothing has been tried yet, so nothing is claimed.
     #[tokio::test]
-    async fn link_probe_is_unknown_when_the_provider_is_not_configured() {
-        let status = SamanProvider::new(Value::Null).probe_link().await;
+    async fn link_state_is_unknown_before_anything_has_connected() {
+        let (port, _) = counting_listener().await;
+        let status = tcp_provider(port).probe_link().await;
         assert_eq!(status.state, LinkState::Unknown, "detail: {}", status.detail);
     }
 
-    /// The probe opens a real socket to a payment terminal, so it must never run
-    /// while a transaction owns the client.
     #[tokio::test]
-    async fn link_probe_does_not_touch_the_terminal_while_busy() {
-        // Point at a closed port: if the probe ran, it would report Down.
+    async fn a_successful_transaction_reports_the_link_as_up() {
+        let port = client::tests_support::spawn_fake_terminal(&[]).await;
+        let provider = SamanProvider::new(full_cfg(port, 0));
+
+        provider.invoke("connectionTest", json!({})).await.unwrap();
+        let status = provider.probe_link().await;
+
+        assert_eq!(status.state, LinkState::Up, "detail: {}", status.detail);
+    }
+
+    /// A refused connection is what an operator needs the hint for.
+    #[tokio::test]
+    async fn a_refused_connection_reports_the_link_as_down_with_the_card_hint() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        let provider = tcp_provider(port);
 
+        let _ = provider.invoke("connectionTest", json!({})).await;
+        let status = provider.probe_link().await;
+
+        assert_eq!(status.state, LinkState::Down, "detail: {}", status.detail);
+        let hint = status.hint.expect("a refused link must explain what to do");
+        assert!(hint.contains("card"), "hint: {hint}");
+    }
+
+    /// Reporting must not contend with a transaction either.
+    #[tokio::test]
+    async fn link_probe_does_not_touch_the_terminal_while_busy() {
+        let (port, _) = counting_listener().await;
         let provider = tcp_provider(port);
         let _busy = provider.client.lock().await;
 
@@ -659,4 +696,5 @@ mod tests {
 
         assert_eq!(status.state, LinkState::Unknown, "detail: {}", status.detail);
     }
+
 }

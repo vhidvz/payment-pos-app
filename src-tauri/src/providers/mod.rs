@@ -204,12 +204,13 @@ pub trait Provider: Send + Sync {
     async fn get_config(&self) -> Value;
     async fn set_config(&self, config: Value) -> Result<(), ProviderError>;
     async fn status(&self) -> ProviderStatus;
-    /// Cheap reachability check for the physical link, for a live status light.
+    /// Reachability of the physical link, for a status light.
     ///
-    /// Implementations MUST NOT disturb a transaction in progress: this runs on a
-    /// UI poll, and the thing on the other end takes people's money. When the
-    /// terminal is busy or holding a session open, report [`LinkState::Unknown`]
-    /// rather than opening a second connection to it.
+    /// Implementations MUST NOT open a connection of their own. This runs on a UI
+    /// poll and the thing on the other end takes people's money; an SSP1126 that
+    /// gets an extra connect/close cycle between transactions turns a 1.5-second
+    /// sale into a 21-second one. Report what real traffic already observed, and
+    /// [`LinkState::Unknown`] when there is nothing to report yet.
     async fn probe_link(&self) -> LinkStatus {
         LinkStatus::new(LinkState::NotApplicable, "this provider has no external link")
     }
