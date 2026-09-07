@@ -698,3 +698,102 @@ mod tests {
     }
 
 }
+
+/// Every operation's opening request, compared byte-for-byte against the same
+/// request produced by the reference `saman-payment-pos` SDK.
+///
+/// This is the property the whole port rests on: the terminal accepts or ignores
+/// a message on its exact bytes. The fixture was captured by running the npm SDK
+/// against a recording socket. Only DE12 (the time the message was built) and the
+/// DE64 MAC computed over it may differ.
+#[cfg(test)]
+mod reference_parity {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    const REFERENCE: &str = include_str!("reference-wire.json");
+
+    fn cases() -> Vec<(&'static str, Value)> {
+        vec![
+            ("connectionTest", json!({})),
+            ("getAuthorizedOperations", json!({})),
+            ("balance", json!({})),
+            ("purchase", json!({ "mainAmount": 10000 })),
+            ("posStarterPurchaseInit", json!({})),
+            ("billPayment", json!({ "billId": "1234567890123", "paymentId": "1234567890" })),
+            ("billRequest", json!({})),
+            ("pinCharge", json!({})),
+            ("topupCharge", json!({ "mobileNumber": "09121234567" })),
+            ("mciBillInquiry", json!({ "mciNumber": "09121234567", "billType": 1 })),
+            ("tciBillInquiry", json!({ "tciNumber": "02188888888", "billType": 1 })),
+            ("totalReport", json!({ "fromDate": "050101", "toDate": "050131" })),
+            ("report", json!({ "filter": 1, "filterValues": ["050101", "050131"], "reportType": 0 })),
+        ]
+    }
+
+    /// DE12 is HHMMSS, three bytes; it sits after DE3, and after DE4 as well when
+    /// the message carries an amount. The trailing eight bytes are the MAC.
+    fn blank_time_and_mac(hex: &str, has_amount: bool) -> String {
+        let de12 = if has_amount { 19 } else { 13 };
+        let mut b: Vec<String> = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        for i in de12..de12 + 3 {
+            b[i] = "..".into();
+        }
+        let n = b.len();
+        for i in n - 8..n {
+            b[i] = "..".into();
+        }
+        b.concat()
+    }
+
+    #[tokio::test]
+    async fn every_opening_request_matches_the_reference_sdk() {
+        let expected: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(REFERENCE).expect("fixture");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let s2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let s = s2.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        if n > 0 {
+                            s.lock()
+                                .await
+                                .push(buf[..n].iter().map(|b| format!("{b:02x}")).collect());
+                        }
+                    }
+                });
+            }
+        });
+
+        for (name, params) in cases() {
+            let provider = SamanProvider::new(json!({
+                "transport": "tcp", "host": "127.0.0.1", "port": port,
+                "firstAckTimeoutMs": 120, "firstAckAttempts": 1,
+                "minReconnectGapMs": 0, "reconnectGapAfterPartialMs": 0
+            }));
+            let before = seen.lock().await.len();
+            let _ = provider.invoke(name, params).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            let got = seen.lock().await.get(before).cloned();
+            let got = got.unwrap_or_else(|| panic!("{name} sent nothing"));
+            let want = expected.get(name).unwrap_or_else(|| panic!("no fixture for {name}"));
+            let has_amount = name == "purchase";
+            assert_eq!(
+                blank_time_and_mac(&got, has_amount),
+                blank_time_and_mac(want, has_amount),
+                "{name} does not match the reference SDK\n  reference {want}\n  ours      {got}"
+            );
+        }
+    }
+}

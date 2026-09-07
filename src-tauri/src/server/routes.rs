@@ -94,7 +94,7 @@ impl FromRequestParts<AppState> for Unlocked {
             Err(fail(
                 StatusCode::UNAUTHORIZED,
                 "locked",
-                "this application is locked; obtain a token from POST /api/v1/auth/unlock",
+                "this application is locked",
             ))
         }
     }

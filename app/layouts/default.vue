@@ -63,8 +63,8 @@
         </button>
       </nav>
 
-      <!-- server + terminal status -->
-      <div class="space-y-2 px-5 pb-5">
+      <!-- server status -->
+      <div class="px-5 pb-5">
         <div class="glass-inset flex items-center gap-2.5 px-3.5 py-3">
           <span class="dot" :class="serverUp ? 'text-ok bg-ok' : 'text-danger bg-danger'" />
           <div class="min-w-0 leading-tight">
@@ -74,22 +74,8 @@
             <div class="truncate font-mono text-[0.6875rem] text-paper-mute tabular">{{ baseHost }}</div>
           </div>
         </div>
-
-        <NuxtLink
-          v-if="link && link.state !== 'notApplicable'"
-          :to="`/providers/${activeProvider}`"
-          class="glass-inset flex items-center gap-2.5 px-3.5 py-3 transition-colors hover:bg-white/4"
-          :title="link.detail"
-        >
-          <span class="dot" :class="terminalDot" />
-          <div class="min-w-0 leading-tight">
-            <div class="text-xs font-medium" :class="link.state === 'down' ? 'text-danger' : 'text-paper-dim'">
-              {{ terminalLabel }}
-            </div>
-            <div class="truncate font-mono text-[0.6875rem] text-paper-mute">{{ activeProvider }}</div>
-          </div>
-        </NuxtLink>
       </div>
+
     </aside>
 
     <!-- --------------------------------------------------------- content -->
@@ -130,22 +116,6 @@ const base = useApiBase()
 const serverUp = ref(false)
 const baseHost = computed(() => base.value.replace(/^https?:\/\//, ''))
 
-const activeProvider = ref('')
-const { status: link } = useProviderLink(activeProvider)
-const terminalDot = computed(() =>
-  link.value?.state === 'up'
-    ? 'text-ok bg-ok'
-    : link.value?.state === 'down'
-      ? 'text-danger bg-danger'
-      : 'text-paper-mute bg-paper-mute',
-)
-const terminalLabel = computed(() =>
-  link.value?.state === 'up'
-    ? 'Terminal reachable'
-    : link.value?.state === 'down'
-      ? 'Terminal unreachable'
-      : 'Terminal state unknown',
-)
 
 const nav = [
   {
@@ -213,8 +183,6 @@ async function poll() {
   try {
     await api.health()
     serverUp.value = true
-    // The active provider can change from Settings or over the API.
-    activeProvider.value = (await api.system()).activeProvider
     // The administrator can set or clear the password while the app is running.
     await auth.refresh()
   } catch {
