@@ -22,6 +22,8 @@ pub struct Layout {
     bin: PathBuf,
     applications: PathBuf,
     icons: PathBuf,
+    /// The installer's own state: the rollback generation, its pointer, the journal.
+    state: PathBuf,
 }
 
 impl Layout {
@@ -33,6 +35,7 @@ impl Layout {
             bin: home.join(".local/bin"),
             applications: data.join("applications"),
             icons: data.join("icons/hicolor"),
+            state: data.join("ledger-pos"),
         }
     }
 
@@ -42,6 +45,7 @@ impl Layout {
             bin: home.join(".local/bin"),
             applications: home.join(".local/share/applications"),
             icons: home.join(".local/share/icons/hicolor"),
+            state: home.join(".local/share/ledger-pos"),
         }
     }
 
@@ -56,6 +60,26 @@ impl Layout {
     }
     pub fn icon_path(&self, size: u32) -> PathBuf {
         self.icons.join(format!("{size}x{size}/apps/{STEM}.png"))
+    }
+    pub fn journal_path(&self) -> PathBuf {
+        self.state.join("install-journal.json")
+    }
+    pub fn prev_pointer(&self) -> PathBuf {
+        self.state.join("prev.json")
+    }
+    pub fn generations_dir(&self) -> PathBuf {
+        self.state.join("generations")
+    }
+    pub fn install_lock_path(&self) -> PathBuf {
+        self.state.join(".install.lock")
+    }
+    /// Every file an install owns, **the desktop entry last** — it carries the version
+    /// key, so it is the last thing a commit changes (spec §3.2).
+    pub fn targets(&self) -> Vec<PathBuf> {
+        let mut t = vec![self.app_path(), self.posd_path()];
+        t.extend(ICON_SIZES.iter().map(|s| self.icon_path(*s)));
+        t.push(self.desktop_path());
+        t
     }
 }
 
@@ -88,6 +112,82 @@ pub struct Report {
 
 pub fn is_installed(layout: &Layout) -> bool {
     layout.app_path().exists() && layout.desktop_path().exists()
+}
+
+/// Desktop Entry `X-*` extension key carrying the installed version (spec §3.1).
+pub const VERSION_KEY: &str = "X-LedgerPOS-Version";
+
+pub fn desktop_entry(app: &Path, version: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Version=1.0\n\
+         Name=Ledger POS\n\
+         Comment=Payment POS terminals as a local REST API\n\
+         Exec={exec}\n\
+         Icon={STEM}\n\
+         Terminal=false\n\
+         Categories=Office;Finance;\n\
+         StartupWMClass=payment-pos-app\n\
+         {VERSION_KEY}={version}\n",
+        exec = quote_exec(app),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnknownReason {
+    /// The key is there but is not a version.
+    BadVersionKey(String),
+    /// An interrupted install that recovery could not finish.
+    UnreconciledJournal,
+}
+
+impl std::fmt::Display for UnknownReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadVersionKey(v) => write!(f, "the menu entry names version \"{v}\""),
+            Self::UnreconciledJournal => write!(f, "an earlier install was interrupted and could not be finished"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Installed {
+    None,
+    /// Installed without a version key: the known pre-1.0 shape, older than every version.
+    Legacy,
+    Version(semver::Version),
+    /// Never ordered against anything; replaced only on explicit confirmation.
+    Unknown(UnknownReason),
+}
+
+pub fn installed(layout: &Layout) -> Installed {
+    // `recover()` runs before anyone asks; a journal still here is one it could not finish.
+    if layout.journal_path().exists() {
+        return Installed::Unknown(UnknownReason::UnreconciledJournal);
+    }
+    if !is_installed(layout) {
+        return Installed::None;
+    }
+    let entry = std::fs::read_to_string(layout.desktop_path()).unwrap_or_default();
+    let prefix = format!("{VERSION_KEY}=");
+    match entry.lines().find_map(|l| l.strip_prefix(prefix.as_str())) {
+        None => Installed::Legacy,
+        Some(raw) => match semver::Version::parse(raw.trim()) {
+            Ok(v) => Installed::Version(v),
+            Err(_) => Installed::Unknown(UnknownReason::BadVersionKey(raw.trim().to_string())),
+        },
+    }
+}
+
+/// How an install is named in a journal or a generation manifest.
+pub fn installed_label(installed: &Installed) -> String {
+    match installed {
+        Installed::None => "none".into(),
+        Installed::Legacy => "legacy".into(),
+        Installed::Version(v) => v.to_string(),
+        Installed::Unknown(_) => "unknown".into(),
+    }
 }
 
 /// Desktop Entry spec: an `Exec` argument containing spaces must be quoted, and
@@ -160,23 +260,7 @@ pub fn install(layout: &Layout, source: &Source) -> Result<Report, String> {
     }
 
     let desktop = layout.desktop_path();
-    write_file(
-        &desktop,
-        format!(
-            "[Desktop Entry]\n\
-             Type=Application\n\
-             Version=1.0\n\
-             Name=Ledger POS\n\
-             Comment=Payment POS terminals as a local REST API\n\
-             Exec={exec}\n\
-             Icon={STEM}\n\
-             Terminal=false\n\
-             Categories=Office;Finance;\n\
-             StartupWMClass=payment-pos-app\n",
-            exec = quote_exec(&app),
-        )
-        .as_bytes(),
-    )?;
+    write_file(&desktop, desktop_entry(&app, crate::version::VERSION).as_bytes())?;
     written.push(desktop);
 
     refresh_desktop_caches(layout);
@@ -368,5 +452,55 @@ mod tests {
     fn uninstalling_when_nothing_is_installed_is_not_an_error() {
         let (_, _, layout) = fake_appimage();
         assert_eq!(uninstall(&layout).unwrap().removed, Vec::<PathBuf>::new());
+    }
+
+    fn entry_with(layout: &Layout, key_line: &str) {
+        std::fs::create_dir_all(layout.app_path().parent().unwrap()).unwrap();
+        std::fs::write(layout.app_path(), b"#app").unwrap();
+        std::fs::create_dir_all(layout.desktop_path().parent().unwrap()).unwrap();
+        std::fs::write(layout.desktop_path(), format!("[Desktop Entry]\nName=Ledger POS\n{key_line}")).unwrap();
+    }
+
+    #[test]
+    fn install_writes_its_version_into_the_desktop_entry() {
+        let (_, source, layout) = fake_appimage();
+        install(&layout, &source).unwrap();
+        let entry = std::fs::read_to_string(layout.desktop_path()).unwrap();
+        assert!(entry.contains(&format!("{VERSION_KEY}={}\n", crate::version::VERSION)), "{entry}");
+        assert_eq!(installed(&layout), Installed::Version(crate::version::current()));
+    }
+
+    #[test]
+    fn classification_of_installed_copies() {
+        let (_, _, layout) = fake_appimage();
+        assert_eq!(installed(&layout), Installed::None);
+        entry_with(&layout, "");
+        assert_eq!(installed(&layout), Installed::Legacy, "no key: the known pre-1.0 shape");
+        entry_with(&layout, "X-LedgerPOS-Version=banana\n");
+        assert_eq!(installed(&layout), Installed::Unknown(UnknownReason::BadVersionKey("banana".into())));
+        entry_with(&layout, "X-LedgerPOS-Version=1.2.3\n");
+        assert_eq!(installed(&layout), Installed::Version(semver::Version::new(1, 2, 3)));
+    }
+
+    #[test]
+    fn version_key_tolerates_whitespace() {
+        let (_, _, layout) = fake_appimage();
+        entry_with(&layout, "X-LedgerPOS-Version= 1.0.0 \r\n");
+        assert_eq!(installed(&layout), Installed::Version(semver::Version::new(1, 0, 0)));
+    }
+
+    #[test]
+    fn a_journal_left_behind_makes_the_install_unknown() {
+        let (_, _, layout) = fake_appimage();
+        entry_with(&layout, "X-LedgerPOS-Version=1.0.0\n");
+        std::fs::create_dir_all(layout.journal_path().parent().unwrap()).unwrap();
+        std::fs::write(layout.journal_path(), b"{}").unwrap();
+        assert_eq!(installed(&layout), Installed::Unknown(UnknownReason::UnreconciledJournal));
+    }
+
+    #[test]
+    fn the_desktop_entry_is_the_last_target() {
+        let (_, _, layout) = fake_appimage();
+        assert_eq!(layout.targets().last(), Some(&layout.desktop_path()));
     }
 }

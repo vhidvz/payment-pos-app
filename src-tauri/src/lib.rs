@@ -18,6 +18,7 @@ pub mod runstate;
 pub mod security;
 pub mod server;
 pub mod settings;
+pub mod update;
 pub mod version;
 
 use std::sync::Arc;
