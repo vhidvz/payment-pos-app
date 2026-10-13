@@ -147,6 +147,21 @@ pub struct SystemInfo {
     pub docs_path: String,
     pub openapi_path: String,
     pub settings_file: String,
+    /// How each data file stands this run (spec §6).
+    pub data: DataStatus,
+    /// Migrations this process performed while starting.
+    pub migrations: Vec<crate::migrate::MigrationRecord>,
+    /// The "updated" notice not yet acknowledged, if any.
+    pub notice: Option<crate::runstate::NoticeView>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DataStatus {
+    pub settings: crate::migrate::FileStatus,
+    pub admin: crate::migrate::FileStatus,
+    pub outbox: crate::migrate::FileStatus,
+    pub state: crate::migrate::FileStatus,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -246,6 +261,22 @@ async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
         docs_path: "/docs".into(),
         openapi_path: "/api-docs/openapi.json".into(),
         settings_file: crate::settings::settings_path().display().to_string(),
+        data: DataStatus {
+            settings: state.settings.status(),
+            admin: if state.auth.admin_file_newer().is_some() {
+                crate::migrate::FileStatus::FailClosed
+            } else {
+                crate::migrate::FileStatus::Ok
+            },
+            outbox: state.events.outbox_status(),
+            state: state.run_state.status(),
+        },
+        migrations: {
+            let mut m = state.settings.migrations();
+            m.extend(state.events.migrations());
+            m
+        },
+        notice: state.run_state.notice(),
     })
 }
 
@@ -830,6 +861,12 @@ async fn index() -> Json<Value> {
         ApiError,
         HealthResponse,
         SystemInfo,
+        DataStatus,
+        crate::migrate::FileStatus,
+        crate::migrate::MigrationRecord,
+        crate::runstate::NoticeView,
+        crate::runstate::Notice,
+        crate::runstate::NoticeKind,
         ServerStatus,
         ProviderSummary,
         ProviderDetail,
@@ -944,6 +981,25 @@ mod tests {
 
     fn test_state() -> AppState {
         state_with_password(None)
+    }
+
+    #[tokio::test]
+    async fn system_reports_each_files_state_and_the_notice() {
+        let state = test_state();
+        state.run_state.record_migrations(&[crate::migrate::MigrationRecord {
+            file: "settings.json".into(),
+            from: 0,
+            to: 1,
+            backup: None,
+            by: "app 1.0.0".into(),
+            at: "t".into(),
+        }]);
+        let (status, body) = send(&state, "GET", "/api/v1/system", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], json!({ "settings": "ok", "admin": "ok", "outbox": "ok", "state": "ok" }));
+        assert_eq!(body["notice"]["migrations"][0]["file"], "settings.json");
+        assert!(body["migrations"].is_array());
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"), "existing fields unchanged");
     }
 
     #[tokio::test]

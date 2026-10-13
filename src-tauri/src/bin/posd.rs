@@ -228,7 +228,14 @@ fn run_admin(command: AdminCommand) -> Result<String, String> {
 
 #[tokio::main]
 async fn main() {
+    // Before anything is loaded: migrations it performs are recorded as posd's, and the
+    // app's run state (`state.json` → `app`) is never touched from here.
+    payment_pos_app_lib::version::set_process("posd");
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--version") {
+        println!("posd {}", payment_pos_app_lib::version::VERSION);
+        return;
+    }
     if let Some(parsed) = parse_admin_command(&args) {
         match parsed.and_then(run_admin) {
             Ok(message) => println!("{message}"),

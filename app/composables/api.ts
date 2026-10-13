@@ -112,6 +112,29 @@ export interface AuthStatus {
   autoLockMinutes: number
 }
 
+export type FileStatus = 'ok' | 'readOnlyNewer' | 'recovered' | 'failClosed'
+
+export interface MigrationRecord {
+  file: string
+  from: number
+  to: number
+  backup?: string
+  by: string
+  at: string
+}
+
+export interface Notice {
+  kind: 'upgraded' | 'downgraded'
+  from: string | null
+  to: string
+  at: string
+}
+
+export interface NoticeView {
+  notice: Notice | null
+  migrations: MigrationRecord[]
+}
+
 export interface SystemInfo {
   name: string
   version: string
@@ -122,6 +145,12 @@ export interface SystemInfo {
   docsPath: string
   openapiPath: string
   settingsFile: string
+  /** How each data file stands this run. */
+  data: { settings: FileStatus; admin: FileStatus; outbox: FileStatus; state: FileStatus }
+  /** Migrations performed while this process started. */
+  migrations: MigrationRecord[]
+  /** The "updated" notice not yet acknowledged. */
+  notice: NoticeView | null
 }
 
 export class ApiError extends Error {
