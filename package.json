@@ -11,7 +11,9 @@
     "build": "nuxt build",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
-    "tauri": "NO_STRIP=true tauri"
+    "tauri": "NO_STRIP=true tauri",
+    "release": "node scripts/release.mjs",
+    "test:scripts": "node --test 'scripts/*.spec.mjs'"
   },
   "dependencies": {
     "@fontsource-variable/fraunces": "^5",
