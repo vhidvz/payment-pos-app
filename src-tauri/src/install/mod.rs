@@ -10,6 +10,8 @@
 //! alike. Native packaging deliberately stays out of scope — an AppImage that
 //! wrote into a package manager's territory would fight it.
 
+pub mod txn;
+
 use std::path::{Path, PathBuf};
 
 /// Basename used for every file we install, so removal can be exact.
@@ -204,67 +206,22 @@ fn quote_exec(path: &Path) -> String {
     )
 }
 
-fn copy_executable(from: &Path, to: &Path) -> Result<(), String> {
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    }
-    // Remove first: overwriting a file that is currently executing fails with ETXTBSY.
-    let _ = std::fs::remove_file(to);
-    std::fs::copy(from, to)
-        .map_err(|e| format!("cannot copy to {}: {e}", to.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("cannot make {} executable: {e}", to.display()))?;
-    }
-    Ok(())
-}
-
-fn write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    }
-    std::fs::write(path, contents).map_err(|e| format!("cannot write {}: {e}", path.display()))
-}
-
-/// Put the app on the menu, give it an icon, and make `posd` reachable.
+/// Put the app on the menu, give it an icon, make `posd` reachable — transactionally:
+/// an interruption is finished by the next start, never left as a mix (spec §3.2).
 /// Re-running repairs rather than fails, so it doubles as a "fix my install".
 pub fn install(layout: &Layout, source: &Source) -> Result<Report, String> {
-    let mut written = Vec::new();
-
-    let app = layout.app_path();
-    copy_executable(&source.appimage, &app)?;
-    written.push(app.clone());
-
-    // `posd` rides inside the AppImage; lift it out so the administrator
-    // commands in the README work without digging into the bundle.
-    let posd_src = source.appdir.join("usr/bin/posd");
-    if posd_src.exists() {
-        let posd = layout.posd_path();
-        copy_executable(&posd_src, &posd)?;
-        written.push(posd);
-    }
-
-    for size in ICON_SIZES {
-        let from = source
-            .appdir
-            .join(format!("usr/share/icons/hicolor/{size}x{size}/apps/payment-pos-app.png"));
-        if !from.exists() {
-            continue;
-        }
-        let to = layout.icon_path(size);
-        let bytes = std::fs::read(&from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
-        write_file(&to, &bytes)?;
-        written.push(to);
-    }
-
-    let desktop = layout.desktop_path();
-    write_file(&desktop, desktop_entry(&app, crate::version::VERSION).as_bytes())?;
-    written.push(desktop);
-
+    let planned = txn::planned_from_appimage(layout, source, crate::version::VERSION);
+    let report = txn::explicit(layout, &planned, crate::version::VERSION, &txn::Options::default())
+        .map_err(|e| e.to_string())?;
     refresh_desktop_caches(layout);
-    Ok(Report { written, removed: Vec::new() })
+    Ok(report)
+}
+
+/// Swap the previous generation back in. Returns the version now installed.
+pub fn rollback(layout: &Layout) -> Result<String, String> {
+    let (_, version) = txn::rollback(layout, &txn::Options::default()).map_err(|e| e.to_string())?;
+    refresh_desktop_caches(layout);
+    Ok(version)
 }
 
 /// Take back exactly what `install` put down, and nothing else — settings and
@@ -281,6 +238,18 @@ pub fn uninstall(layout: &Layout) -> Result<Report, String> {
             Err(e) => return Err(format!("cannot remove {}: {e}", path.display())),
         }
     }
+    // The rollback generation, its pointer and any journal are ours too.
+    let _ = std::fs::remove_dir_all(layout.generations_dir());
+    for p in [layout.prev_pointer(), layout.journal_path(), layout.install_lock_path()] {
+        let _ = std::fs::remove_file(p);
+    }
+    for entry in std::fs::read_dir(&layout.state).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with("install-journal.failed-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    txn::gc(layout); // staged leftovers
+    let _ = std::fs::remove_dir(&layout.state); // only when empty
     refresh_desktop_caches(layout);
     Ok(Report { written: Vec::new(), removed })
 }
@@ -502,5 +471,66 @@ mod tests {
     fn the_desktop_entry_is_the_last_target() {
         let (_, _, layout) = fake_appimage();
         assert_eq!(layout.targets().last(), Some(&layout.desktop_path()));
+    }
+}
+
+/// Fixtures shared by the transaction and engine tests: an AppImage whose every file
+/// carries its version, so an old set and a new one differ byte for byte.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub fn root() -> PathBuf {
+        let r = std::env::temp_dir().join(format!("ledger-txn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&r).unwrap();
+        r
+    }
+
+    pub fn layout(root: &Path) -> Layout {
+        Layout::under(&root.join("home"))
+    }
+
+    pub fn appimage(root: &Path, version: &str) -> Source {
+        let base = root.join(format!("src-{version}"));
+        let appdir = base.join("mnt");
+        std::fs::create_dir_all(appdir.join("usr/bin")).unwrap();
+        std::fs::write(appdir.join("usr/bin/posd"), format!("#posd {version}")).unwrap();
+        for size in [128u32, 256] {
+            let p = appdir.join(format!("usr/share/icons/hicolor/{size}x{size}/apps/payment-pos-app.png"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("#png {size} {version}")).unwrap();
+        }
+        let file = base.join(format!("Ledger POS_{version}_amd64.AppImage"));
+        std::fs::write(&file, format!("#appimage {version}")).unwrap();
+        Source { appimage: file, appdir }
+    }
+
+    /// Every target holds exactly `version`'s bytes, and the menu entry names it.
+    pub fn assert_set(layout: &Layout, version: &str) {
+        let read = |p: PathBuf| std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert_eq!(read(layout.app_path()), format!("#appimage {version}"));
+        assert_eq!(read(layout.posd_path()), format!("#posd {version}"));
+        assert_eq!(read(layout.icon_path(128)), format!("#png 128 {version}"));
+        assert!(read(layout.desktop_path()).contains(&format!("{VERSION_KEY}={version}\n")));
+    }
+
+    /// No staged file and no unreferenced generation is left behind.
+    pub fn assert_clean(layout: &Layout) {
+        for t in layout.targets() {
+            let dir = t.parent().unwrap();
+            let prefix = format!("{}.new-", t.file_name().unwrap().to_string_lossy());
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                assert!(!e.file_name().to_string_lossy().starts_with(&prefix), "leftover {}", e.path().display());
+            }
+        }
+        let gens: Vec<_> = std::fs::read_dir(layout.generations_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let kept: Vec<String> = super::txn::prev_gen(layout).into_iter().collect();
+        assert_eq!(gens, kept, "only the generation prev.json names survives");
+        assert!(!layout.journal_path().exists());
     }
 }

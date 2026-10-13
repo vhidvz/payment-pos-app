@@ -17,10 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Data files carry a schema version and migrate on start, keeping a `<file>.v<N>.bak` copy of the original. @vhidvz
 - Settings written by a newer version are never overwritten: changes are refused with `409 settings_read_only`. @vhidvz
 - A newer version's administrator file keeps the console locked; `posd admin` refuses to change it. @vhidvz
+- The previous installed version is kept for one rollback (`--rollback`). @vhidvz
 
 ### Changed
 
 - While the app closes for an update, every change request gets `503 updating`; reads keep working. @vhidvz
+- Installs are transactional: an interrupted install is finished on the next start, never left as a mix. @vhidvz
 
 ### Fixed
 
