@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opening a newer AppImage offers to update the installed copy; the running copy finishes its sale first. @vhidvz
 - `--update`, `--rollback`, `--install --allow-downgrade` and `--version`; `posd --version` too. @vhidvz
 - After an update the console says once what changed; Settings → About shows each data file's state. @vhidvz
+- Release workflow: a `v*` tag builds AppImage, deb, rpm and msi into a draft GitHub release. @vhidvz
 
 ### Changed
 
