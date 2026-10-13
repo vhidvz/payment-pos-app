@@ -7,6 +7,7 @@
 
 pub mod activity;
 pub mod events;
+pub mod fsutil;
 pub mod install;
 pub mod posture;
 pub mod providers;
