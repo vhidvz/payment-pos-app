@@ -53,6 +53,11 @@ base64 = "0.22"
 getrandom = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
+# The update engine talks to a running copy over the single-instance plugin's D-Bus name
+# (src/update/system.rs); zbus is already in the tree through that plugin.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 

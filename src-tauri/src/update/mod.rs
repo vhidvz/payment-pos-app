@@ -1,5 +1,8 @@
 //! Whether this run is a normal start or an update screen (spec §3.1).
 
+pub mod engine;
+pub mod system;
+
 use std::path::Path;
 
 use crate::install::{Installed, UnknownReason};
