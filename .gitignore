@@ -2,7 +2,8 @@
 node_modules/
 .nuxt/
 .output/
-dist/
+# `nuxt generate` leaves dist as a symlink to .output/public, which `dist/` would not match.
+dist
 .data/
 .env
 .env.*
