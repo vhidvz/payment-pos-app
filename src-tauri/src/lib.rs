@@ -13,6 +13,7 @@ pub mod migrate;
 pub mod posture;
 pub mod providers;
 pub mod receipts;
+pub mod runstate;
 pub mod security;
 pub mod server;
 pub mod settings;
@@ -59,9 +60,19 @@ pub fn build_state() -> AppState {
         Arc::new(SandboxProvider::new(cfg(providers::sandbox::PROVIDER_ID))),
     ]));
     let auth = Arc::new(AuthState::new(crate::security::admin_path()));
-    let mut state = AppState::new(settings, registry, auth);
+    let mut state = AppState::new(settings.clone(), registry, auth);
     // Undelivered webhook messages survive a restart in the real app.
     state.events = Arc::new(events::EventBus::new(Some(events::EventBus::default_outbox_path())));
+    // Run state after the file migrations, so this start's migrations are recorded and the
+    // app's notice sees them (spec §4). `posd` records migrations but never touches `app`.
+    let run_state = Arc::new(runstate::StateStore::open(runstate::state_path()));
+    let mut migrated = settings.migrations();
+    migrated.extend(state.events.migrations());
+    run_state.record_migrations(&migrated);
+    if version::is_app() {
+        run_state.note_app_start(version::VERSION);
+    }
+    state.run_state = run_state;
     state
 }
 

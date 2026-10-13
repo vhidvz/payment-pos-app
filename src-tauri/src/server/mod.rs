@@ -51,6 +51,9 @@ pub struct AppState {
     /// Webhook events ([`crate::events`]). In memory unless the caller swaps in a
     /// persistent bus, which [`crate::build_state`] does for the real app.
     pub events: Arc<EventBus>,
+    /// `state.json`: the last version that ran and the pending "updated" notice
+    /// ([`crate::runstate`]). In memory unless [`crate::build_state`] opens the file.
+    pub run_state: Arc<crate::runstate::StateStore>,
     pub started_at: std::time::Instant,
     pub server_status: Arc<RwLock<ServerStatus>>,
 }
@@ -67,6 +70,7 @@ impl AppState {
             auth,
             activity: Arc::new(ActivityLog::default()),
             events: Arc::new(EventBus::new(None)),
+            run_state: Arc::new(crate::runstate::StateStore::in_memory()),
             started_at: std::time::Instant::now(),
             server_status: Arc::new(RwLock::new(ServerStatus::default())),
         }
