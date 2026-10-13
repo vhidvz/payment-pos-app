@@ -704,8 +704,8 @@ mod tests {
 ///
 /// This is the property the whole port rests on: the terminal accepts or ignores
 /// a message on its exact bytes. The fixture was captured by running the npm SDK
-/// against a recording socket. Only DE12 (the time the message was built) and the
-/// DE64 MAC computed over it may differ.
+/// against a recording socket. Only DE12/DE13 (the time and date the message was
+/// built) and the DE64 MAC computed over it may differ.
 #[cfg(test)]
 mod reference_parity {
     use super::*;
@@ -731,8 +731,10 @@ mod reference_parity {
         ]
     }
 
-    /// DE12 is HHMMSS, three bytes; it sits after DE3, and after DE4 as well when
-    /// the message carries an amount. The trailing eight bytes are the MAC.
+    /// DE12 is HHMMSS, three bytes, and DE13 right after it is MMDD, two more — together
+    /// the moment the message was built, so the date differs from the fixture's on every
+    /// day but the one it was captured. They sit after DE3, and after DE4 as well when the
+    /// message carries an amount. The trailing eight bytes are the MAC.
     fn blank_time_and_mac(hex: &str, has_amount: bool) -> String {
         let de12 = if has_amount { 19 } else { 13 };
         let mut b: Vec<String> = hex
@@ -740,7 +742,7 @@ mod reference_parity {
             .chunks(2)
             .map(|c| String::from_utf8_lossy(c).into_owned())
             .collect();
-        for i in de12..de12 + 3 {
+        for i in de12..de12 + 5 {
             b[i] = "..".into();
         }
         let n = b.len();
