@@ -12,6 +12,15 @@ use serde_json::Value;
 use tokio::sync::watch;
 use utoipa::ToSchema;
 
+use crate::migrate::{
+    commit_upgrade, keep_invalid, read_and_upgrade, record, stamp, FileStatus, Loaded, MigrateLock,
+    MigrationRecord, Outcome, Step,
+};
+
+pub const SETTINGS_SCHEMA: u32 = 1;
+/// 0 → 1: 0.1.0's file, unchanged in shape; only the version is stamped.
+pub const SETTINGS_STEPS: &[Step] = &[Step { to: 1, apply: crate::migrate::noop }];
+
 pub const DEFAULT_PORT: u16 = 4373;
 pub const APP_DIR_NAME: &str = "ledger-pos";
 
@@ -117,6 +126,9 @@ pub enum SettingsError {
     Invalid(String),
     #[error("failed to persist settings: {0}")]
     Io(#[from] std::io::Error),
+    /// The file belongs to a newer version: never written (spec §2.3).
+    #[error("{0}")]
+    ReadOnly(String),
 }
 
 pub fn validate(s: &Settings) -> Result<(), SettingsError> {
@@ -142,36 +154,75 @@ pub fn settings_path() -> PathBuf {
 pub struct SettingsStore {
     path: PathBuf,
     tx: watch::Sender<Settings>,
+    status: FileStatus,
+    /// Why writes are refused, when the file belongs to a newer version.
+    read_only: Option<String>,
+    migrations: Vec<MigrationRecord>,
 }
 
 impl SettingsStore {
-    /// Load settings from disk (writing defaults on first run or unreadable file).
+    /// Load settings from disk (writing defaults on first run).
     pub fn load() -> Self {
         Self::at(settings_path())
     }
 
     /// Same, for an explicit path — the seam tests use so they never touch the
-    /// real configuration file.
+    /// real configuration file. Migrates under the migrate lock (spec §2.2); a newer
+    /// file is read leniently and never written (§2.3).
     pub fn at(path: PathBuf) -> Self {
-        let settings = match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("settings file unreadable ({e}); keeping it and using defaults");
-                    // Preserve the broken file for the user instead of overwriting it.
-                    let backup = path.with_extension("json.invalid");
-                    let _ = std::fs::copy(&path, &backup);
-                    Settings::default()
-                }
-            },
-            Err(_) => {
+        let dir = path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let _lock = MigrateLock::acquire(&dir)
+            .map_err(|e| tracing::warn!("cannot take the migrate lock in {} ({e})", dir.display()))
+            .ok();
+        let mut migrations = Vec::new();
+        let (settings, status, read_only) = match read_and_upgrade(&path, SETTINGS_STEPS) {
+            Loaded::Missing => {
                 let s = Settings::default();
                 let _ = persist(&path, &s);
-                s
+                (s, FileStatus::Ok, None)
             }
+            Loaded::Ready { doc, outcome } => match serde_json::from_value::<Settings>(doc) {
+                Ok(s) => {
+                    if let Outcome::Upgraded { from, to } = outcome {
+                        match commit_upgrade(&path, from, &render(&s)) {
+                            Ok(backup) => migrations.push(record(&path, from, to, Some(&backup))),
+                            Err(e) => tracing::warn!("cannot write migrated settings ({e}); using them in memory"),
+                        }
+                    }
+                    (s, FileStatus::Ok, None)
+                }
+                Err(e) => recovered(&path, &e.to_string()),
+            },
+            Loaded::Newer { doc, found, supported } => {
+                let why = format!(
+                    "{} was written by a newer Ledger POS (schema {found}; this version understands \
+                     {supported}) — open that version, or restore a .bak backup beside it",
+                    path.display()
+                );
+                tracing::warn!("{why}; settings are read-only this run");
+                let s = serde_json::from_value::<Settings>(doc).unwrap_or_default();
+                (s, FileStatus::ReadOnlyNewer, Some(why))
+            }
+            Loaded::Broken(e) => recovered(&path, &e),
         };
         let (tx, _) = watch::channel(settings);
-        Self { path, tx }
+        Self { path, tx, status, read_only, migrations }
+    }
+
+    pub fn status(&self) -> FileStatus {
+        self.status
+    }
+
+    /// The migrations this store performed while loading.
+    pub fn migrations(&self) -> Vec<MigrationRecord> {
+        self.migrations.clone()
+    }
+
+    pub fn ensure_writable(&self) -> Result<(), SettingsError> {
+        match &self.read_only {
+            Some(why) => Err(SettingsError::ReadOnly(why.clone())),
+            None => Ok(()),
+        }
     }
 
     pub fn get(&self) -> Settings {
@@ -187,6 +238,7 @@ impl SettingsStore {
         &self,
         mutate: impl FnOnce(&mut Settings),
     ) -> Result<Settings, SettingsError> {
+        self.ensure_writable()?;
         let mut next = self.get();
         mutate(&mut next);
         validate(&next)?;
@@ -196,14 +248,126 @@ impl SettingsStore {
     }
 }
 
+/// Today's unreadable-file behaviour: keep it as `.invalid`, run on defaults.
+fn recovered(path: &std::path::Path, why: &str) -> (Settings, FileStatus, Option<String>) {
+    tracing::warn!("settings file unreadable ({why}); keeping it as .invalid and using defaults");
+    keep_invalid(path);
+    (Settings::default(), FileStatus::Recovered, None)
+}
+
+fn render(s: &Settings) -> Vec<u8> {
+    let mut doc = serde_json::to_value(s).expect("settings serialize");
+    stamp(&mut doc, SETTINGS_SCHEMA).expect("settings serialize to an object");
+    serde_json::to_vec_pretty(&doc).expect("settings serialize")
+}
+
+/// Write-then-rename (with fsync) so a crash mid-write can't truncate the settings file.
 fn persist(path: &PathBuf, s: &Settings) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let meta = std::fs::metadata(path).ok();
+    crate::fsutil::atomic_write(path, &render(s), meta.as_ref(), 0o644)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate::{assert_contiguous, FileStatus, SCHEMA_KEY};
+
+    fn dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ledger-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
-    let json = serde_json::to_string_pretty(s).expect("settings serialize");
-    // Write-then-rename so a crash mid-write can't truncate the settings file.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+
+    /// A settings file exactly as 0.1.0 wrote it: no schema key.
+    const V0: &str = r#"{
+      "server": { "host": "127.0.0.1", "port": 4999, "corsAllowedOrigins": [], "corsAllowAll": false },
+      "app": { "minimizeToTrayOnClose": true, "startAtBoot": true, "startMinimized": false, "installPromptDismissed": true },
+      "providers": { "active": "saman-ssp1126", "configs": { "saman-ssp1126": { "transport": "tcp", "host": "192.168.1.198", "port": 1197 } } }
+    }"#;
+
+    #[test]
+    fn the_chain_is_contiguous() {
+        assert_contiguous(SETTINGS_STEPS);
+    }
+
+    #[test]
+    fn a_v0_file_is_migrated_with_every_value_kept_and_a_backup() {
+        let d = dir();
+        let p = d.join("settings.json");
+        std::fs::write(&p, V0).unwrap();
+
+        let store = SettingsStore::at(p.clone());
+        let s = store.get();
+        assert_eq!(s.server.port, 4999);
+        assert!(s.app.start_at_boot);
+        assert_eq!(s.providers.active, "saman-ssp1126");
+        assert_eq!(s.providers.configs["saman-ssp1126"]["host"], "192.168.1.198");
+
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(on_disk[SCHEMA_KEY], SETTINGS_SCHEMA);
+        assert_eq!(std::fs::read_to_string(d.join("settings.json.v0.bak")).unwrap(), V0);
+        let m = store.migrations();
+        assert_eq!((m.len(), m[0].from, m[0].to), (1, 0, 1));
+        assert_eq!(store.status(), FileStatus::Ok);
+    }
+
+    /// A crash after the backup but before the write: the next start migrates again and
+    /// never overwrites the original backup.
+    #[test]
+    fn a_replayed_migration_keeps_the_first_backup() {
+        let d = dir();
+        let p = d.join("settings.json");
+        std::fs::write(d.join("settings.json.v0.bak"), "the original").unwrap();
+        std::fs::write(&p, V0).unwrap();
+        let _ = SettingsStore::at(p.clone());
+        assert_eq!(std::fs::read_to_string(d.join("settings.json.v0.bak")).unwrap(), "the original");
+    }
+
+    #[test]
+    fn a_newer_file_is_read_and_never_written() {
+        let d = dir();
+        let p = d.join("settings.json");
+        let newer = V0.replacen('{', r#"{ "schemaVersion": 9, "futureField": [1,2,3],"#, 1);
+        std::fs::write(&p, &newer).unwrap();
+
+        let store = SettingsStore::at(p.clone());
+        assert_eq!(store.get().server.port, 4999, "known fields read leniently");
+        assert_eq!(store.status(), FileStatus::ReadOnlyNewer);
+        assert!(matches!(store.update(|s| s.server.port = 1), Err(SettingsError::ReadOnly(_))));
+        assert!(matches!(store.ensure_writable(), Err(SettingsError::ReadOnly(_))));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), newer, "byte-identical");
+    }
+
+    #[test]
+    fn an_invalid_version_is_recovered_not_read_as_zero() {
+        let d = dir();
+        let p = d.join("settings.json");
+        let bad = V0.replacen('{', r#"{ "schemaVersion": "1","#, 1);
+        std::fs::write(&p, &bad).unwrap();
+        let store = SettingsStore::at(p.clone());
+        assert_eq!(store.status(), FileStatus::Recovered);
+        assert_eq!(store.get(), Settings::default());
+        assert_eq!(std::fs::read_to_string(d.join("settings.json.invalid")).unwrap(), bad);
+    }
+
+    #[test]
+    fn every_write_carries_the_schema() {
+        let d = dir();
+        let p = d.join("settings.json");
+        let store = SettingsStore::at(p.clone());
+        store.update(|s| s.server.port = 5000).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(on_disk[SCHEMA_KEY], SETTINGS_SCHEMA);
+        assert_eq!(on_disk["server"]["port"], 5000);
+    }
+
+    /// The API body has no schema key, before or after.
+    #[test]
+    fn the_schema_key_never_reaches_the_model() {
+        let d = dir();
+        let p = d.join("settings.json");
+        std::fs::write(&p, V0).unwrap();
+        let v = serde_json::to_value(SettingsStore::at(p).get()).unwrap();
+        assert!(v.get(SCHEMA_KEY).is_none());
+    }
 }

@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional signed receipts: an `attestation` JWS (HS256) on each invoke of the active terminal; `posd admin receipt-key`. @vhidvz
 - Events and receipts carry the device posture: password set, unlocked now, and a fingerprint of the payment settings. @vhidvz
 - `GET /api/v1/events` shows subscriptions (scheme and host only), signing and delivery state, never a secret. @vhidvz
+- Data files carry a schema version and migrate on start, keeping a `<file>.v<N>.bak` copy of the original. @vhidvz
+- Settings written by a newer version are never overwritten: changes are refused with `409 settings_read_only`. @vhidvz
 
 ### Fixed
 

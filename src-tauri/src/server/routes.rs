@@ -67,6 +67,15 @@ fn provider_error(e: ProviderError) -> ApiFailure {
     }
 }
 
+fn settings_failure(e: crate::settings::SettingsError) -> ApiFailure {
+    match e {
+        crate::settings::SettingsError::ReadOnly(why) => {
+            fail(StatusCode::CONFLICT, "settings_read_only", why)
+        }
+        other => fail(StatusCode::BAD_REQUEST, "invalid_settings", other.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------- auth gate
 
 /// Reads the bearer token, if the caller presented one.
@@ -250,12 +259,16 @@ async fn get_settings(State(state): State<AppState>) -> Json<Settings> {
     request_body = Settings,
     responses(
         (status = 200, description = "Settings updated", body = SettingsUpdateResponse),
-        (status = 400, description = "Validation failed", body = ApiError)))]
+        (status = 400, description = "Validation failed", body = ApiError),
+        (status = 409, description = "The settings file belongs to a newer version", body = ApiError)))]
 async fn put_settings(
     State(state): State<AppState>,
     _: Unlocked,
     Json(body): Json<Settings>,
 ) -> Result<Json<SettingsUpdateResponse>, ApiFailure> {
+    // Before any provider sees the new config, so the live provider and the file can
+    // never diverge when the file is read-only.
+    state.settings.ensure_writable().map_err(settings_failure)?;
     if state.registry.get(&body.providers.active).is_none() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -287,7 +300,7 @@ async fn put_settings(
     let next = state
         .settings
         .update(|s| *s = body)
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_settings", e.to_string()))?;
+        .map_err(settings_failure)?;
     let server_restarting = before.server != next.server;
     Ok(Json(SettingsUpdateResponse {
         settings: next,
@@ -412,7 +425,8 @@ async fn get_active_provider(
     request_body = SetActiveRequest,
     responses(
         (status = 200, description = "Active provider changed", body = ProviderDetail),
-        (status = 404, description = "Unknown provider", body = ApiError)))]
+        (status = 404, description = "Unknown provider", body = ApiError),
+        (status = 409, description = "The settings file belongs to a newer version", body = ApiError)))]
 async fn set_active_provider(
     State(state): State<AppState>,
     _: Unlocked,
@@ -422,7 +436,7 @@ async fn set_active_provider(
     state
         .settings
         .update(|s| s.providers.active = body.id.clone())
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_settings", e.to_string()))?;
+        .map_err(settings_failure)?;
     Ok(Json(provider_detail_of(&state, p).await))
 }
 
@@ -723,7 +737,7 @@ async fn get_provider_config(
         (status = 200, description = "Configuration applied and persisted", body = Object),
         (status = 400, description = "Invalid configuration", body = ApiError),
         (status = 404, description = "Unknown provider", body = ApiError),
-        (status = 409, description = "Provider busy; try again", body = ApiError)))]
+        (status = 409, description = "Provider busy, or the settings file belongs to a newer version", body = ApiError)))]
 async fn put_provider_config(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -731,13 +745,14 @@ async fn put_provider_config(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiFailure> {
     let p = provider_or_404(&state, &id)?;
+    state.settings.ensure_writable().map_err(settings_failure)?;
     p.set_config(body.clone()).await.map_err(provider_error)?;
     state
         .settings
         .update(|s| {
             s.providers.configs.insert(id.clone(), body.clone());
         })
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, "invalid_settings", e.to_string()))?;
+        .map_err(settings_failure)?;
     Ok(Json(p.get_config().await))
 }
 
@@ -921,6 +936,27 @@ mod tests {
 
     fn test_state() -> AppState {
         state_with_password(None)
+    }
+
+    #[tokio::test]
+    async fn read_only_settings_answer_409_and_change_nothing() {
+        let dir = std::env::temp_dir().join(format!("ledger-ro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"schemaVersion": 9}"#).unwrap();
+        let settings = Arc::new(SettingsStore::at(path.clone()));
+        let registry = Arc::new(ProviderRegistry::new(vec![Arc::new(SandboxProvider::new(Value::Null))]));
+        let state = AppState::new(settings, registry, Arc::new(AuthState::new(dir.join("admin.json"))));
+
+        let body = serde_json::to_value(state.settings.get()).unwrap();
+        let (status, err) = send(&state, "PUT", "/api/v1/settings", None, Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err["code"], "settings_read_only");
+
+        let (status, err) = send(&state, "PUT", "/api/v1/providers/sandbox/config", None, Some(json!({}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err["code"], "settings_read_only");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"schemaVersion": 9}"#);
     }
 
     async fn send(
