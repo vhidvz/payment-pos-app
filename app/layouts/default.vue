@@ -81,6 +81,8 @@
     <!-- --------------------------------------------------------- content -->
     <main class="min-w-0 flex-1 overflow-y-auto">
       <div class="mx-auto max-w-[1060px] px-10 pt-10 pb-20">
+        <VersionNotice />
+        <DataBanner />
         <slot />
       </div>
     </main>
@@ -181,7 +183,8 @@ let idleTimer: ReturnType<typeof setInterval> | undefined
 
 async function poll() {
   try {
-    await api.health()
+    const health = await api.health()
+    useApiVersion().value = health.version
     serverUp.value = true
     // The administrator can set or clear the password while the app is running.
     await auth.refresh()

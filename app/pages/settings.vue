@@ -173,6 +173,24 @@
         </p>
       </GlassCard>
 
+      <!-- about -->
+      <GlassCard data-reveal>
+        <h2 class="display mb-1 text-xl text-paper">About</h2>
+        <p class="mb-5 text-xs text-paper-mute">The version running, and how each data file stands.</p>
+        <dl class="grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-5">
+          <div>
+            <dt class="data-label mb-1">Version</dt>
+            <dd class="font-mono text-paper">{{ system?.version ?? '—' }}</dd>
+          </div>
+          <div v-for="(label, key) in DATA_FILES" :key="key">
+            <dt class="data-label mb-1">{{ label }}</dt>
+            <dd :class="system?.data[key] === 'ok' ? 'text-paper-dim' : 'text-warn'">
+              {{ system ? STATUS_TEXT[system.data[key]] : '—' }}
+            </dd>
+          </div>
+        </dl>
+      </GlassCard>
+
       <!-- file location -->
       <GlassCard data-reveal :pad="false" class="px-6 py-4">
         <div class="flex flex-wrap items-center justify-between gap-3">
@@ -197,7 +215,7 @@
 </template>
 
 <script setup lang="ts">
-import type { ProviderSummary, Settings } from '~/composables/api'
+import type { FileStatus, ProviderSummary, Settings, SystemInfo } from '~/composables/api'
 
 const api = useApi()
 const auth = useAuth()
@@ -234,6 +252,15 @@ useReveal(root)
 const model = ref<Settings | null>(null)
 const providerList = ref<ProviderSummary[]>([])
 const settingsFile = ref('')
+const system = ref<SystemInfo | null>(null)
+
+const DATA_FILES = { settings: 'Settings', admin: 'Administrator file', outbox: 'Webhook outbox', state: 'Run state' } as const
+const STATUS_TEXT: Record<FileStatus, string> = {
+  ok: 'up to date',
+  readOnlyNewer: 'newer — read-only',
+  recovered: 'recovered — see .invalid',
+  failClosed: 'newer — locked',
+}
 const saving = ref(false)
 const loadError = ref('')
 
@@ -260,6 +287,7 @@ async function load() {
     model.value = s
     providerList.value = p
     settingsFile.value = sys.settingsFile
+    system.value = sys
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : 'Failed to load settings'
   }
