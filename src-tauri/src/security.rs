@@ -23,6 +23,11 @@ use crate::receipts::ReceiptKey;
 pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 15;
 pub const MIN_PASSWORD_LEN: usize = 4;
 
+pub const ADMIN_SCHEMA: u32 = 1;
+/// 0 → 1: unchanged in shape; only the version is stamped, by the next `posd admin` write.
+pub const ADMIN_STEPS: &[crate::migrate::Step] =
+    &[crate::migrate::Step { to: 1, apply: crate::migrate::noop }];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AdminConfig {
@@ -52,8 +57,13 @@ impl Default for AdminConfig {
 ///
 /// Deliberately not overridable by an environment variable: pointing the app at
 /// an empty file elsewhere would be a one-line bypass for exactly the user this
-/// is meant to constrain.
+/// is meant to constrain. The one exception is a build with the `e2e` feature, which
+/// release builds never enable, so the end-to-end harness never reads the real file.
 pub fn admin_path() -> PathBuf {
+    #[cfg(feature = "e2e")]
+    if let Some(p) = std::env::var_os("LEDGER_POS_ADMIN_PATH") {
+        return PathBuf::from(p);
+    }
     default_admin_path()
 }
 
@@ -91,16 +101,47 @@ pub fn load_from(path: &Path) -> AdminConfig {
 /// "no password set". So a bad entry is dropped with a warning, and only a file
 /// that is not JSON at all, or whose password section is malformed, is an error.
 pub fn try_load_from(path: &Path) -> Result<AdminConfig, String> {
+    read_admin(path).map(|r| r.cfg)
+}
+
+/// The administrator file and the schema it was written with.
+pub struct AdminRead {
+    pub cfg: AdminConfig,
+    /// The schema the file declared (0 for a pre-1.0 file; current for a missing one).
+    pub schema: u32,
+    /// `Some(found)` when a newer version wrote it — the console must stay locked.
+    pub newer: Option<u32>,
+}
+
+/// The administrator file, migrated in memory (spec §2.3). Never writes: the app runs
+/// unprivileged, and the next `sudo posd admin` write persists the new schema.
+pub fn read_admin(path: &Path) -> Result<AdminRead, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AdminConfig::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AdminRead { cfg: AdminConfig::default(), schema: ADMIN_SCHEMA, newer: None })
+        }
         Err(e) => return Err(format!("administrator file {} is unreadable ({e})", path.display())),
     };
     let unreadable = |e: String| format!("administrator file {} is unreadable ({e})", path.display());
     let mut doc: serde_json::Value = serde_json::from_str(&raw).map_err(|e| unreadable(e.to_string()))?;
+    let schema = crate::migrate::schema_of(&doc).map_err(|e| unreadable(e.to_string()))?;
+    let newer = match crate::migrate::upgrade(&mut doc, ADMIN_STEPS) {
+        Ok(_) => None,
+        Err(crate::migrate::MigrateError::Newer { found, .. }) => Some(found),
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    crate::migrate::strip(&mut doc);
+    let cfg = parse_lenient(path, doc).map_err(unreadable)?;
+    Ok(AdminRead { cfg, schema, newer })
+}
+
+/// See [`try_load_from`]: one bad webhook or key entry is dropped with a warning instead
+/// of failing the whole file.
+fn parse_lenient(path: &Path, mut doc: serde_json::Value) -> Result<AdminConfig, String> {
     let events = doc.as_object_mut().and_then(|o| o.remove("events"));
     let receipt_key = doc.as_object_mut().and_then(|o| o.remove("receiptKey"));
-    let mut cfg: AdminConfig = serde_json::from_value(doc).map_err(|e| unreadable(e.to_string()))?;
+    let mut cfg: AdminConfig = serde_json::from_value(doc).map_err(|e| e.to_string())?;
 
     if let Some(events) = events {
         cfg.events.device_id = events.get("deviceId").and_then(|v| v.as_str()).map(String::from);
@@ -121,15 +162,12 @@ pub fn try_load_from(path: &Path) -> Result<AdminConfig, String> {
 }
 
 pub fn save_to(path: &Path, cfg: &AdminConfig) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let json = serde_json::to_string_pretty(cfg).expect("admin config serialize");
-    let previous = std::fs::metadata(path).ok();
+    let mut doc = serde_json::to_value(cfg).expect("admin config serialize");
+    crate::migrate::stamp(&mut doc, ADMIN_SCHEMA).expect("an object");
+    let json = serde_json::to_vec_pretty(&doc).expect("admin config serialize");
     // Write-then-rename: the running app re-reads this file every few seconds, and a
     // half-written one would read as "no password set" for that moment.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
+    //
     // The app runs unprivileged and must be able to read this to verify a
     // password; only root may write it. An administrator running the daemon under
     // its own account can narrow this further (see `posd admin status`).
@@ -137,23 +175,11 @@ pub fn save_to(path: &Path, cfg: &AdminConfig) -> std::io::Result<()> {
     // **The existing mode and owner are kept; 0644 is only for a new file.** This
     // used to re-apply 0644 on every write, so an administrator who narrowed the
     // file to 0640 — as `status` advises, and as the webhook secrets and the receipt
-    // key now need — had it widened again by the next `set-password`, silently.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        match &previous {
-            Some(meta) => {
-                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
-                // Only root can give a file away; as anyone else the owner is already ours.
-                let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
-            }
-            None => std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?,
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = &previous;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // key now need — had it widened again by the next `set-password`, silently. And the
+    // temp file is created with that mode from the start: it holds the hash and the
+    // secrets, so it must never exist under the default umask, even for a moment.
+    let previous = std::fs::metadata(path).ok();
+    crate::fsutil::atomic_write(path, &json, previous.as_ref(), 0o644)
 }
 
 /// Hash a password for storage. Returns a PHC string.
@@ -224,6 +250,8 @@ fn failure_delay(consecutive_failures: u32) -> Duration {
 pub enum UnlockError {
     NoPasswordSet,
     InvalidPassword,
+    /// A newer version wrote the administrator file: fail closed (spec §2.3).
+    AdminFileNewer(u32),
 }
 
 /// Runtime lock state: the administrator file plus the sessions minted from it.
@@ -263,9 +291,28 @@ impl AuthState {
         self.admin().password_hash.is_some()
     }
 
+    /// The file with its schema; an unreadable one reads as "no password set", as before.
+    fn admin_read(&self) -> AdminRead {
+        read_admin(&self.admin_file).unwrap_or_else(|e| {
+            tracing::warn!("{e}; treating it as no password set");
+            AdminRead { cfg: AdminConfig::default(), schema: 0, newer: None }
+        })
+    }
+
+    /// `Some(schema)` when a newer version wrote the administrator file: the console
+    /// stays locked, because a lenient read of a renamed field could look like "no
+    /// password" (spec §2.3, fail-closed).
+    pub fn admin_file_newer(&self) -> Option<u32> {
+        self.admin_read().newer
+    }
+
     /// Exchange a password for a session token.
     pub async fn unlock(&self, password: &str) -> Result<String, UnlockError> {
-        let admin = self.admin();
+        let read = self.admin_read();
+        if let Some(found) = read.newer {
+            return Err(UnlockError::AdminFileNewer(found));
+        }
+        let admin = read.cfg;
         let Some(hash) = admin.password_hash else {
             return Err(UnlockError::NoPasswordSet);
         };
@@ -301,7 +348,11 @@ impl AuthState {
     /// webhook receiver or a receipt verifier needs — [`Self::is_unlocked`] answers
     /// it for one caller.
     pub fn any_unlocked(&self) -> bool {
-        let admin = self.admin();
+        let read = self.admin_read();
+        if read.newer.is_some() {
+            return false;
+        }
+        let admin = read.cfg;
         let Some(current) = admin.password_hash.as_deref() else {
             return true;
         };
@@ -318,7 +369,11 @@ impl AuthState {
     /// True when the caller may perform a protected action. Refreshes the
     /// session's idle clock as a side effect.
     pub fn is_unlocked(&self, token: Option<&str>) -> bool {
-        let admin = self.admin();
+        let read = self.admin_read();
+        if read.newer.is_some() {
+            return false;
+        }
+        let admin = read.cfg;
         let Some(current) = admin.password_hash.as_deref() else {
             return true; // no password configured: the app is open, as before
         };
@@ -639,9 +694,24 @@ pub fn clear_receipt_key_at(path: &Path) -> Result<(), String> {
 fn amend(path: &Path, change: impl FnOnce(&mut AdminConfig)) -> Result<(), String> {
     // Never write over a file that did not parse: `load_from` would hand back the
     // defaults, and writing them would erase the password hash for good.
-    let mut cfg = try_load_from(path)
-        .map_err(|e| format!("{e}; fix or remove it by hand — nothing was changed"))?;
+    let read = read_admin(path).map_err(|e| format!("{e}; fix or remove it by hand — nothing was changed"))?;
+    // Nor over one a newer version wrote: this posd would drop what it does not know.
+    if let Some(found) = read.newer {
+        return Err(format!(
+            "{} was written by a newer Ledger POS (schema {found}; this posd understands {ADMIN_SCHEMA}) \
+             — use that version's posd; nothing was changed",
+            path.display()
+        ));
+    }
+    let mut cfg = read.cfg;
     change(&mut cfg);
+    // The first write in the new schema keeps the original, with its mode and owner —
+    // it holds the password hash and the secrets.
+    if read.schema < ADMIN_SCHEMA && path.exists() {
+        let bak = crate::migrate::backup_path(path, read.schema);
+        crate::fsutil::backup_once(path, &bak)
+            .map_err(|e| format!("cannot back up {} ({e}); nothing was changed", path.display()))?;
+    }
     save_to(path, &cfg).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
@@ -663,8 +733,14 @@ pub fn set_auto_lock_at(path: &Path, minutes: u32) -> Result<(), String> {
 
 /// Human-readable summary of the administrator file.
 pub fn status_report(path: &Path) -> String {
-    let cfg = load_from(path);
+    let read = read_admin(path).unwrap_or(AdminRead { cfg: AdminConfig::default(), schema: 0, newer: None });
+    let cfg = read.cfg;
     let mut out = format!("administrator file : {}\n", path.display());
+    out.push_str(&match (read.newer, read.schema) {
+        (Some(n), _) => format!("schema             : {n} — written by a newer Ledger POS; this posd will not change it\n"),
+        (None, s) if s < ADMIN_SCHEMA => format!("schema             : {s} — upgraded to {ADMIN_SCHEMA} by the next change\n"),
+        (None, s) => format!("schema             : {s}\n"),
+    });
     out.push_str(if cfg.password_hash.is_some() {
         "application        : a password is set\n"
     } else {
@@ -1017,3 +1093,90 @@ mod events_admin_tests {
     }
 }
 
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn admin_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ledger-admin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_admin_chain_is_contiguous() {
+        crate::migrate::assert_contiguous(ADMIN_STEPS);
+    }
+
+    #[test]
+    fn a_v0_file_reads_in_memory_and_is_not_written_by_reading() {
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        let v0 = format!(r#"{{"passwordHash":"{}","autoLockMinutes":7}}"#, hash_password("secret").unwrap());
+        std::fs::write(&p, &v0).unwrap();
+        let read = read_admin(&p).unwrap();
+        assert_eq!((read.schema, read.newer, read.cfg.auto_lock_minutes), (0, None, 7));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), v0, "reading never writes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_write_backs_up_with_the_originals_mode_then_stamps() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        std::fs::write(&p, r#"{"autoLockMinutes":7}"#).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        set_auto_lock_at(&p, 9).unwrap();
+
+        let bak = d.join("admin.json.v0.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"autoLockMinutes":7}"#);
+        assert_eq!(std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o640);
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!((on_disk["schemaVersion"].as_u64(), on_disk["autoLockMinutes"].as_u64()), (Some(1), Some(9)));
+    }
+
+    #[tokio::test]
+    async fn a_newer_admin_file_fails_closed() {
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        // A newer version that renamed the hash field: an older lenient read would see "no
+        // password" — which must NOT open the console.
+        std::fs::write(&p, r#"{"schemaVersion":5,"credential":{"hash":"x"}}"#).unwrap();
+        let auth = AuthState::new(p.clone());
+        assert_eq!(auth.admin_file_newer(), Some(5));
+        assert!(!auth.is_unlocked(None));
+        assert!(!auth.any_unlocked());
+        assert_eq!(auth.unlock("anything").await, Err(UnlockError::AdminFileNewer(5)));
+    }
+
+    #[test]
+    fn posd_refuses_to_write_a_newer_admin_file() {
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        let newer = r#"{"schemaVersion":5}"#;
+        std::fs::write(&p, newer).unwrap();
+        let err = set_auto_lock_at(&p, 3).unwrap_err();
+        assert!(err.contains("newer"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), newer);
+    }
+
+    #[test]
+    fn status_reports_the_schema() {
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        std::fs::write(&p, r#"{"autoLockMinutes":7}"#).unwrap();
+        assert!(status_report(&p).contains("schema             : 0 — upgraded to 1 by the next change"));
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    #[test]
+    fn release_builds_ignore_the_admin_path_override() {
+        std::env::set_var("LEDGER_POS_ADMIN_PATH", "/tmp/elsewhere.json");
+        assert_eq!(admin_path(), default_admin_path());
+        std::env::remove_var("LEDGER_POS_ADMIN_PATH");
+    }
+}

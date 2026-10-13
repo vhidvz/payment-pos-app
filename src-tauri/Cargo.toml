@@ -56,6 +56,11 @@ reqwest = { version = "0.13", default-features = false, features = ["native-tls"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
+[features]
+# End-to-end builds only: lets LEDGER_POS_ADMIN_PATH move the administrator file so the
+# e2e harness never reads the machine's real one. Release builds never enable it.
+e2e = []
+
 [[bin]]
 name = "payment-pos-app"
 path = "src/main.rs"

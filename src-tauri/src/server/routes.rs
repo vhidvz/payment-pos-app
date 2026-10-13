@@ -344,6 +344,14 @@ async fn auth_unlock(
             "no_password_set",
             "no application password is set; nothing to unlock",
         )),
+        Err(UnlockError::AdminFileNewer(found)) => Err(fail(
+            StatusCode::CONFLICT,
+            "admin_file_newer",
+            format!(
+                "the administrator file was written by a newer Ledger POS (schema {found}); \
+                 the console stays locked — open that version"
+            ),
+        )),
         Err(UnlockError::InvalidPassword) => Err(fail(
             StatusCode::UNAUTHORIZED,
             "invalid_password",
@@ -986,6 +994,22 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn unlock_against_a_newer_admin_file_answers_409() {
+        let dir = std::env::temp_dir().join(format!("ledger-newer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("admin.json"), r#"{"schemaVersion":5}"#).unwrap();
+        let settings = Arc::new(SettingsStore::at(dir.join("settings.json")));
+        let registry = Arc::new(ProviderRegistry::new(vec![Arc::new(SandboxProvider::new(Value::Null))]));
+        let state = AppState::new(settings, registry, Arc::new(AuthState::new(dir.join("admin.json"))));
+        let (status, err) = send(&state, "POST", "/api/v1/auth/unlock", None, Some(json!({ "password": "x" }))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err["code"], "admin_file_newer");
+        let body = serde_json::to_value(state.settings.get()).unwrap();
+        let (status, _) = send(&state, "PUT", "/api/v1/settings", None, Some(body)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "fail-closed: the console stays locked");
     }
 
     async fn unlock(state: &AppState, password: &str) -> String {
