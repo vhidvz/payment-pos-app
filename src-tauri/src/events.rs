@@ -243,6 +243,10 @@ pub fn envelope(
 
 pub struct EventBus {
     outbox_path: Option<PathBuf>,
+    /// False when the file belongs to a newer version: it is never written (spec §2.3).
+    outbox_writable: bool,
+    outbox_status: crate::migrate::FileStatus,
+    migrations: Vec<crate::migrate::MigrationRecord>,
     outbox: Mutex<Vec<Delivery>>,
     /// Every subscription seen during this process's life, by id. A message queued
     /// for a subscription that has since been removed — `events.config_changed` goes
@@ -267,37 +271,116 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Read the outbox file. An unreadable one is kept aside as `.invalid` rather than
-/// silently replaced — undelivered messages are evidence somebody may want back.
-fn load_outbox(path: &std::path::Path) -> Vec<Delivery> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new();
+pub const OUTBOX_SCHEMA: u32 = 1;
+/// 0 → 1: the bare array becomes `{ "deliveries": [...] }`, every element kept in order,
+/// so the file can carry a schema version.
+pub const OUTBOX_STEPS: &[crate::migrate::Step] = &[crate::migrate::Step { to: 1, apply: wrap_outbox }];
+
+fn wrap_outbox(doc: &mut Value) -> Result<(), String> {
+    if !doc.is_array() {
+        return Err("a schema-0 outbox must be a JSON array".into());
+    }
+    let items = doc.take();
+    *doc = json!({ "deliveries": items });
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct OutboxFile {
+    #[serde(default)]
+    deliveries: Vec<Delivery>,
+}
+
+fn render_outbox(deliveries: &[Delivery]) -> Vec<u8> {
+    let mut doc = json!({ "deliveries": deliveries });
+    crate::migrate::stamp(&mut doc, OUTBOX_SCHEMA).expect("an object");
+    serde_json::to_vec_pretty(&doc).expect("outbox serialize")
+}
+
+struct LoadedOutbox {
+    deliveries: Vec<Delivery>,
+    writable: bool,
+    status: crate::migrate::FileStatus,
+    migrations: Vec<crate::migrate::MigrationRecord>,
+}
+
+/// Read the outbox file (spec §2.3). Unreadable ⇒ kept aside as `.invalid`, as before —
+/// undelivered messages are evidence somebody may want back. Newer ⇒ not loaded, never
+/// written: this run's events stay in memory.
+fn load_outbox(path: &std::path::Path) -> LoadedOutbox {
+    use crate::migrate::{FileStatus, Loaded, Outcome};
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let _lock = crate::migrate::MigrateLock::acquire(dir).ok();
+    let broken = |why: String| {
+        tracing::warn!(
+            "event outbox {} is unreadable ({why}); keeping it as .invalid and starting empty",
+            path.display()
+        );
+        crate::migrate::keep_invalid(path);
+        LoadedOutbox { deliveries: Vec::new(), writable: true, status: FileStatus::Recovered, migrations: Vec::new() }
     };
-    match serde_json::from_str::<Vec<Delivery>>(&raw) {
-        Ok(outbox) => outbox,
-        Err(e) => {
+    match crate::migrate::read_and_upgrade(path, OUTBOX_STEPS) {
+        Loaded::Missing => {
+            LoadedOutbox { deliveries: Vec::new(), writable: true, status: FileStatus::Ok, migrations: Vec::new() }
+        }
+        Loaded::Ready { doc, outcome } => match serde_json::from_value::<OutboxFile>(doc) {
+            Ok(file) => {
+                let mut migrations = Vec::new();
+                if let Outcome::Upgraded { from, to } = outcome {
+                    match crate::migrate::commit_upgrade(path, from, &render_outbox(&file.deliveries)) {
+                        Ok(b) => migrations.push(crate::migrate::record(path, from, to, Some(&b))),
+                        Err(e) => tracing::warn!("cannot write the migrated outbox ({e}); using it in memory"),
+                    }
+                }
+                LoadedOutbox { deliveries: file.deliveries, writable: true, status: FileStatus::Ok, migrations }
+            }
+            Err(e) => broken(e.to_string()),
+        },
+        Loaded::Newer { found, supported, .. } => {
             tracing::warn!(
-                "event outbox {} is unreadable ({e}); keeping it as .invalid and starting empty",
+                "event outbox {} was written by a newer Ledger POS (schema {found}, this version understands \
+                 {supported}); left untouched — this run's events are kept in memory only",
                 path.display()
             );
-            let _ = std::fs::copy(path, path.with_extension("json.invalid"));
-            Vec::new()
+            LoadedOutbox {
+                deliveries: Vec::new(),
+                writable: false,
+                status: FileStatus::ReadOnlyNewer,
+                migrations: Vec::new(),
+            }
         }
+        Loaded::Broken(e) => broken(e),
     }
 }
 
 impl EventBus {
     /// `outbox_path: None` keeps undelivered messages in memory only (tests, one-shot CLI use).
     pub fn new(outbox_path: Option<PathBuf>) -> Self {
-        let outbox = outbox_path.as_deref().map(load_outbox).unwrap_or_default();
+        let loaded = outbox_path.as_deref().map(load_outbox);
+        let (outbox, outbox_writable, outbox_status, migrations) = match loaded {
+            Some(l) => (l.deliveries, l.writable, l.status, l.migrations),
+            None => (Vec::new(), true, crate::migrate::FileStatus::Ok, Vec::new()),
+        };
         Self {
             outbox_path,
+            outbox_writable,
+            outbox_status,
+            migrations,
             outbox: Mutex::new(outbox),
             known: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
             persist_lock: Mutex::new(()),
             client: http_client().expect("http client"),
         }
+    }
+
+    pub fn outbox_status(&self) -> crate::migrate::FileStatus {
+        self.outbox_status
+    }
+
+    /// The migrations loading the outbox performed.
+    pub fn migrations(&self) -> Vec<crate::migrate::MigrationRecord> {
+        self.migrations.clone()
     }
 
     /// The outbox beside `settings.json`.
@@ -410,12 +493,14 @@ impl EventBus {
         let Some(path) = &self.outbox_path else {
             return;
         };
+        if !self.outbox_writable {
+            return; // a newer version's outbox: never written (spec §2.3)
+        }
         let _guard = self.persist_lock.lock().expect("persist lock");
         // Snapshot inside the guard: the last writer always writes the newest state.
         let snapshot = self.outbox.lock().expect("outbox").clone();
-        let json = serde_json::to_string_pretty(&snapshot).expect("outbox serialize");
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path)) {
+        let meta = std::fs::metadata(path).ok();
+        if let Err(e) = crate::fsutil::atomic_write(path, &render_outbox(&snapshot), meta.as_ref(), 0o600) {
             tracing::warn!("cannot persist the event outbox {}: {e}", path.display());
         }
     }
@@ -918,5 +1003,72 @@ mod tests {
     fn a_malformed_secret_is_refused_without_echoing_it() {
         let err = sign("whsec_not*base64", "m", 1, "{}").unwrap_err();
         assert!(!err.contains('*'), "{err}");
+    }
+
+    fn outbox_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ledger-outbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn delivery(n: u32) -> Delivery {
+        Delivery {
+            msg_id: format!("msg_{n}"),
+            event_type: "settings.changed".into(),
+            subscription: "sub_1".into(),
+            url: "https://example.com/h".into(),
+            body: format!("{{\"n\":{n}}}"),
+            created_at: 1_700_000_000 + i64::from(n),
+            attempts: n,
+            next_at: 1_700_000_100,
+        }
+    }
+
+    #[test]
+    fn the_outbox_chain_is_contiguous() {
+        crate::migrate::assert_contiguous(OUTBOX_STEPS);
+    }
+
+    /// v0 was a bare array of pending deliveries: every one survives, in order.
+    #[test]
+    fn a_v0_outbox_keeps_every_pending_delivery_in_order() {
+        let d = outbox_dir();
+        let p = d.join("events-outbox.json");
+        let pending = vec![delivery(1), delivery(2), delivery(3)];
+        std::fs::write(&p, serde_json::to_string(&pending).unwrap()).unwrap();
+
+        let bus = EventBus::new(Some(p.clone()));
+        assert_eq!(*bus.outbox.lock().unwrap(), pending);
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(on_disk["schemaVersion"], OUTBOX_SCHEMA);
+        assert_eq!(on_disk["deliveries"], serde_json::to_value(&pending).unwrap());
+        assert!(d.join("events-outbox.json.v0.bak").exists());
+        assert_eq!(bus.migrations().len(), 1);
+    }
+
+    #[test]
+    fn a_newer_outbox_is_not_loaded_sent_or_modified() {
+        let d = outbox_dir();
+        let p = d.join("events-outbox.json");
+        let newer = r#"{"schemaVersion":7,"deliveries":[{"msgId":"x"}],"futureQueue":[]}"#;
+        std::fs::write(&p, newer).unwrap();
+
+        let bus = EventBus::new(Some(p.clone()));
+        assert!(bus.outbox.lock().unwrap().is_empty(), "nothing loaded, so nothing is sent");
+        assert_eq!(bus.outbox_status(), crate::migrate::FileStatus::ReadOnlyNewer);
+        bus.outbox.lock().unwrap().push(delivery(9));
+        bus.persist();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), newer, "byte-identical");
+    }
+
+    #[test]
+    fn a_v0_object_is_broken_and_kept_aside() {
+        let d = outbox_dir();
+        let p = d.join("events-outbox.json");
+        std::fs::write(&p, r#"{"not":"an array"}"#).unwrap();
+        let bus = EventBus::new(Some(p.clone()));
+        assert!(bus.outbox.lock().unwrap().is_empty());
+        assert_eq!(bus.outbox_status(), crate::migrate::FileStatus::Recovered);
+        assert!(d.join("events-outbox.json.invalid").exists());
     }
 }
