@@ -6,6 +6,7 @@
 //! start-at-boot syncing, single-instance focus, and a couple of UI commands.
 
 pub mod activity;
+pub mod admission;
 pub mod events;
 pub mod fsutil;
 pub mod install;

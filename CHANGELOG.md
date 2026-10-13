@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Settings written by a newer version are never overwritten: changes are refused with `409 settings_read_only`. @vhidvz
 - A newer version's administrator file keeps the console locked; `posd admin` refuses to change it. @vhidvz
 
+### Changed
+
+- While the app closes for an update, every change request gets `503 updating`; reads keep working. @vhidvz
+
 ### Fixed
 
 - `posd admin` no longer resets the administrator file to 0644 on every write, undoing an administrator's `chmod 640`. @vhidvz

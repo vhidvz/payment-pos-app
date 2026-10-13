@@ -54,6 +54,8 @@ pub struct AppState {
     /// `state.json`: the last version that ran and the pending "updated" notice
     /// ([`crate::runstate`]). In memory unless [`crate::build_state`] opens the file.
     pub run_state: Arc<crate::runstate::StateStore>,
+    /// Drain gate: every mutating request holds a ticket ([`crate::admission`]).
+    pub admission: Arc<crate::admission::Admission>,
     pub started_at: std::time::Instant,
     pub server_status: Arc<RwLock<ServerStatus>>,
 }
@@ -71,6 +73,7 @@ impl AppState {
             activity: Arc::new(ActivityLog::default()),
             events: Arc::new(EventBus::new(None)),
             run_state: Arc::new(crate::runstate::StateStore::in_memory()),
+            admission: Arc::new(crate::admission::Admission::new()),
             started_at: std::time::Instant::now(),
             server_status: Arc::new(RwLock::new(ServerStatus::default())),
         }

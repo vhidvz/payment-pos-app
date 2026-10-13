@@ -939,6 +939,7 @@ pub fn build_router(state: AppState) -> Router {
             post(invoke_function),
         )
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admission::gate))
         .with_state(state)
 }
 
@@ -981,6 +982,60 @@ mod tests {
 
     fn test_state() -> AppState {
         state_with_password(None)
+    }
+
+    #[tokio::test]
+    async fn while_draining_writes_get_503_and_reads_still_work() {
+        let state = test_state();
+        let a = state.admission.clone();
+        tokio::spawn(async move { a.drain(std::time::Duration::from_secs(1)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (status, body) = send(
+            &state,
+            "POST",
+            "/api/v1/providers/sandbox/functions/purchase/invoke",
+            None,
+            Some(json!({ "mainAmount": 1000 })),
+        )
+        .await;
+        assert_eq!((status, body["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("updating")));
+        let body = serde_json::to_value(state.settings.get()).unwrap();
+        let (status, _) = send(&state, "PUT", "/api/v1/settings", None, Some(body)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = send(&state, "GET", "/api/v1/health", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// An invoke already running when the drain starts completes normally, and the drain
+    /// waits for it.
+    #[tokio::test]
+    async fn an_in_flight_invoke_completes_and_the_drain_waits_for_it() {
+        let state = test_state();
+        // `SandboxConfig` (sandbox.rs:28-41) is camelCase, deny_unknown_fields; failRate 0 by default.
+        let p = state.registry.get("sandbox").unwrap();
+        p.set_config(json!({ "latencyMs": 0, "cardPresentDelayMs": 400 })).await.unwrap();
+
+        let st = state.clone();
+        let sale = tokio::spawn(async move {
+            send(
+                &st,
+                "POST",
+                "/api/v1/providers/sandbox/functions/purchase/invoke",
+                None,
+                Some(json!({ "mainAmount": 1000 })),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let drained = state.admission.drain(std::time::Duration::from_secs(5)).await;
+        // Without the gate the drain would return at once; it must sit out the ~350 ms
+        // of card wait still ahead of the sale.
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250), "{:?}", started.elapsed());
+        let (status, _) = sale.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(drained);
     }
 
     #[tokio::test]
