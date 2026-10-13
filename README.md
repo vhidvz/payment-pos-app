@@ -12,7 +12,10 @@ operations so you can build your integration without hardware.
 
 ## Install
 
-No prebuilt downloads yet — you build it once, then install what that produces.
+**Download** the file for your system from the
+[GitHub releases](https://github.com/vhidvz/payment-pos-app/releases) — or build it yourself (below).
+Linux needs WebKitGTK 4.1: Ubuntu 22.04, Debian 12, Fedora 36 or newer, and any current Arch or
+Manjaro.
 
 ### 1. Prerequisites
 
@@ -58,8 +61,8 @@ menu; accept, and you are done. Nothing needs a password.
 
 ```sh
 cd src-tauri/target/release/bundle/appimage
-chmod +x "Ledger POS_0.1.0_amd64.AppImage"
-./"Ledger POS_0.1.0_amd64.AppImage"
+chmod +x "Ledger POS_<version>_amd64.AppImage"
+./"Ledger POS_<version>_amd64.AppImage"
 ```
 
 It copies itself to `~/.local/bin/ledger-pos.AppImage`, writes the menu entry and
@@ -69,7 +72,7 @@ launch **Ledger POS** from the menu; the offer is never made again.
 The same thing without the window, for setting up several machines:
 
 ```sh
-./"Ledger POS_0.1.0_amd64.AppImage" --install         # --uninstall, --install-status
+./"Ledger POS_<version>_amd64.AppImage" --install     # --uninstall, --install-status, --version
 ```
 
 `--uninstall` takes back exactly those files and leaves your settings alone.
@@ -83,14 +86,36 @@ The same thing without the window, for setting up several machines:
 
 | System | Command |
 | --- | --- |
-| Debian / Ubuntu | `sudo apt install "./deb/Ledger POS_0.1.0_amd64.deb"` |
-| Fedora / RHEL | `sudo rpm -i "./rpm/Ledger POS-0.1.0-1.x86_64.rpm"` |
-| Windows | run `msi/Ledger POS_0.1.0_x64_en-US.msi` |
+| Debian / Ubuntu | `sudo apt install "./deb/Ledger POS_<version>_amd64.deb"` |
+| Fedora / RHEL | `sudo rpm -i "./rpm/Ledger POS-<version>-1.x86_64.rpm"` |
+| Windows | run `msi/Ledger POS_<version>_x64_en-US.msi` |
 
 These put `payment-pos-app` and `posd` in `/usr/bin` and add **Ledger POS** to
 the application menu — the package manager does the whole job, so there is no
 wizard and nothing further to do. Arch and Manjaro take neither format; use the
 AppImage above.
+
+## Updating
+
+**AppImage:** open the new file. If an older version is installed it offers **Update and
+restart**: the running copy finishes any sale in progress, closes, and the new version starts in
+its place — from the menu, as before. The same from a terminal, for scripts:
+
+```sh
+./"Ledger POS_<version>_amd64.AppImage" --update
+~/.local/bin/ledger-pos.AppImage --rollback        # the previous version, kept for one rollback
+```
+
+`posd` must not be running while it updates — stop its service first; started again, it runs the
+new version. Opening an *older* file never replaces a newer install; `--install --allow-downgrade`
+does, on purpose.
+
+**Packages:** install the new `.deb`, `.rpm` or `.msi` over the old one.
+
+Either way your settings carry over. On the first start each data file is brought up to date and
+the original is kept beside it as `<file>.v<N>.bak`; the console says once what changed. A file
+written by a *newer* version is never overwritten — settings turn read-only, and a newer
+administrator file keeps the console locked — so going back a version cannot lose data.
 
 ## Setup
 
@@ -124,7 +149,7 @@ curl -X POST localhost:4373/api/v1/providers/saman-ssp1126/functions/purchase/in
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/v1/health` | Is it alive |
-| GET | `/api/v1/system` | Version, active terminal, server address, settings file |
+| GET | `/api/v1/system` | Version, active terminal, server address, settings file, data-file state |
 | GET/PUT | `/api/v1/settings` | Read / replace all settings |
 | GET | `/api/v1/activity` | Recent operations |
 | GET | `/api/v1/providers` | Installed terminal types |
@@ -145,15 +170,19 @@ to about two minutes. Only one transaction runs per terminal at a time.
 Failures are `{ "code": "...", "error": "..." }`:
 
 `400 invalid_params` · `401 locked` `invalid_password` · `404 unknown_provider`
-`unknown_function` · `409 busy` · `412 not_configured` `no_password_set` ·
-`502 execution_failed` (terminal reached, operation failed) ·
-`503 terminal_unreachable` (terminal not accepting connections)
+`unknown_function` · `409 busy` · `409 settings_read_only` (settings written by a newer
+version) · `409 admin_file_newer` (the console stays locked) · `412 not_configured`
+`no_password_set` · `502 execution_failed` (terminal reached, operation failed) ·
+`503 terminal_unreachable` (terminal not accepting connections) · `503 updating` (closing for an
+update — retry in a moment)
 
 ## Settings
 
 All in `~/.config/ledger-pos/settings.json` (`%APPDATA%\\ledger-pos\\settings.json` on
 Windows) — editable in the app, over the API,
-or by hand. Changing the API host/port rebinds immediately; if the new address
+or by hand. Beside it: `events-outbox.json` (undelivered webhooks) and `state.json` (the last
+version that ran). Each file carries a `schemaVersion`; *Settings → About* shows how each one
+stands. Changing the API host/port rebinds immediately; if the new address
 cannot be used it falls back to the last working one and reports why in
 `/api/v1/system`, so you cannot lock yourself out.
 
@@ -291,6 +320,18 @@ because the posture travels with every sale.
 - `corsAllowAll` would let any web page you visit call the API from your browser.
 - The link to the terminal is checked for corruption but **not encrypted**. Keep
   it on a network you trust.
+
+## Releasing
+
+```sh
+pnpm release 1.1.0               # sets the version everywhere, moves [Unreleased] into [1.1.0]
+git commit -am "Release 1.1.0"   # on a branch; merge it to main
+git tag v1.1.0 && git push origin main v1.1.0
+```
+
+The tag builds every package into a **draft** GitHub release with the CHANGELOG section as its
+text; check the files, then publish. *Actions → release → Run workflow* builds the same packages
+without a release, to try them before tagging.
 
 ## License
 
