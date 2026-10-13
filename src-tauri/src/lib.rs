@@ -7,6 +7,7 @@
 
 pub mod activity;
 pub mod admission;
+pub mod cli;
 pub mod events;
 pub mod fsutil;
 pub mod install;
@@ -111,6 +112,7 @@ fn install_status(state: tauri::State<'_, AppState>) -> InstallInfo {
 
 #[tauri::command]
 fn install_app(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<InstallInfo, String> {
+    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
     let source = install::Source::detect()
         .ok_or("this build is not an AppImage, so there is nothing to integrate")?;
     let layout = install::Layout::current();
@@ -126,6 +128,7 @@ fn install_app(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Inst
 
 #[tauri::command]
 fn uninstall_app(state: tauri::State<'_, AppState>) -> Result<InstallInfo, String> {
+    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
     install::uninstall(&install::Layout::current())?;
     Ok(install_info(&state))
 }
@@ -133,11 +136,95 @@ fn uninstall_app(state: tauri::State<'_, AppState>) -> Result<InstallInfo, Strin
 /// Remember that the offer was declined, so it is made once and not again.
 #[tauri::command]
 fn dismiss_install_prompt(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
     state
         .settings
         .update(|s| s.app.install_prompt_dismissed = true)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------- versions and updates
+
+#[tauri::command]
+fn boot_mode(info: tauri::State<'_, update::BootInfo>) -> update::BootInfo {
+    info.inner().clone()
+}
+
+#[tauri::command]
+fn version_notice(state: tauri::State<'_, AppState>) -> Option<runstate::NoticeView> {
+    state.run_state.notice()
+}
+
+#[tauri::command]
+fn ack_version_notice(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
+    state.run_state.ack()
+}
+
+/// The update screen's world: where to install, and the machine it acts on.
+struct UpdateCtx {
+    layout: install::Layout,
+    sys: update::system::RealSystem,
+}
+
+fn emitter(app: &AppHandle) -> impl FnMut(update::engine::Progress) + '_ {
+    use tauri::Emitter;
+    move |p| {
+        let _ = app.emit("update://progress", &p);
+    }
+}
+
+#[tauri::command]
+async fn start_update(app: AppHandle) -> Result<update::engine::EngineOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let ctx = app.state::<UpdateCtx>();
+        let source = install::Source::detect().ok_or("this copy is not an AppImage")?;
+        let installed = install::installed(&ctx.layout);
+        let t = update::engine::Timeouts::default();
+        Ok(update::engine::run_update(&ctx.sys, &ctx.layout, &source, &installed, &t, &mut emitter(&app)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn relaunch_update(app: AppHandle) -> Result<update::engine::EngineOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let ctx = app.state::<UpdateCtx>();
+        let t = update::engine::Timeouts::default();
+        Ok(update::engine::relaunch(&ctx.sys, &ctx.layout, &t, &mut emitter(&app)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// After a launch failure: put the previous version back, then start it.
+#[tauri::command]
+async fn rollback_update(app: AppHandle) -> Result<update::engine::EngineOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let ctx = app.state::<UpdateCtx>();
+        install::rollback(&ctx.layout)?;
+        let t = update::engine::Timeouts::default();
+        Ok(update::engine::relaunch(&ctx.sys, &ctx.layout, &t, &mut emitter(&app)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// "Not now" / "Open installed version": start (or surface) the installed copy, then leave.
+#[tauri::command]
+fn open_installed(app: AppHandle) -> Result<(), String> {
+    use update::system::System;
+    let ctx = app.state::<UpdateCtx>();
+    ctx.sys.spawn_detached(&ctx.layout.app_path())?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
 }
 
 // ------------------------------------------------------------- UI commands
@@ -330,88 +417,81 @@ fn tune_webview_env() {
 #[cfg(not(target_os = "linux"))]
 fn tune_webview_env() {}
 
-/// `--install` / `--uninstall` / `--install-status`, handled before the GUI
-/// starts so the same binary can be driven from a provisioning script.
-/// Returns true when the process has done its job and should exit.
-fn handle_install_cli() -> bool {
-    let arg = std::env::args().nth(1);
-    let layout = install::Layout::current();
-    match arg.as_deref() {
-        Some("--install") => {
-            match install::Source::detect() {
-                None => {
-                    eprintln!(
-                        "--install only applies to the AppImage build; this copy was started another way."
-                    );
-                    std::process::exit(2);
-                }
-                Some(source) => match install::install(&layout, &source) {
-                    Ok(report) => {
-                        println!("Installed Ledger POS for {}:", whoami());
-                        for p in report.written {
-                            println!("  {}", p.display());
-                        }
-                        println!(
-                            "\nLauncher: your application menu. Administrator commands: posd admin status"
-                        );
-                        println!(
-                            "If `posd` is not found, add ~/.local/bin to your PATH."
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("install failed: {e}");
-                        std::process::exit(1);
-                    }
-                },
-            }
-            true
-        }
-        Some("--uninstall") => {
-            match install::uninstall(&layout) {
-                Ok(report) if report.removed.is_empty() => println!("Nothing was installed."),
-                Ok(report) => {
-                    println!("Removed:");
-                    for p in report.removed {
-                        println!("  {}", p.display());
-                    }
-                    println!("\nYour settings and the administrator file were left untouched.");
-                }
-                Err(e) => {
-                    eprintln!("uninstall failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-            true
-        }
-        Some("--install-status") => {
-            println!("appimage   : {}", install::Source::detect().is_some());
-            println!("installed  : {}", install::is_installed(&layout));
-            println!("app        : {}", layout.app_path().display());
-            println!("desktop    : {}", layout.desktop_path().display());
-            println!("posd       : {}", layout.posd_path().display());
-            true
-        }
-        _ => false,
-    }
-}
-
-fn whoami() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "this user".into())
-}
-
 pub fn run() {
-    if handle_install_cli() {
-        return;
-    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let background = match cli::parse(&args) {
+        cli::Cli::Gui { background } => background,
+        // `--install`, `--update`, `--version`… are handled before any window opens, so the
+        // same binary can be driven from a provisioning script.
+        verb => std::process::exit(cli::run(verb)),
+    };
     init_tracing();
     tune_webview_env();
+    let layout = install::Layout::current();
+    if let Err(e) = install::txn::recover(&layout) {
+        tracing::warn!("an interrupted install could not be finished ({e}); the update screen offers a repair");
+    }
+    // Decided before Tauri starts: once the single-instance plugin runs, a launch that finds
+    // an older copy in the tray is handed to it and this process exits (spec §3.1).
+    let source = install::Source::detect();
+    let from_installed = source.as_ref().is_some_and(|s| update::same_file(&s.appimage, &layout.app_path()));
+    match update::plan(&version::current(), &install::installed(&layout), source.is_some(), from_installed) {
+        update::Boot::Normal => run_normal(background),
+        boot => run_update_mode(boot, layout),
+    }
+}
+
+/// An update screen instead of the app (spec §3.1): no single-instance, no API server, no
+/// tray, no events — and no settings loaded, so nothing migrates until the new version
+/// runs installed.
+fn run_update_mode(boot: update::Boot, layout: install::Layout) {
+    use update::system::System;
+    let sys = update::system::RealSystem::new();
+    let info = update::BootInfo::from_boot(&boot, sys.instance_pid().is_some());
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(info)
+        .manage(UpdateCtx { layout, sys })
+        .invoke_handler(tauri::generate_handler![
+            boot_mode,
+            start_update,
+            relaunch_update,
+            rollback_update,
+            open_installed,
+            quit_app
+        ])
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title("Update Ledger POS");
+                let _ = window.show();
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running the update screen");
+}
+
+fn run_normal(background: bool) {
     let state = build_state();
-    let background = std::env::args().any(|a| a == "--background" || a == "--minimized");
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // A second launch just surfaces the existing instance.
-            show_main_window(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|a| a == update::system::QUIT_FOR_UPDATE) {
+                // An update is replacing this copy (spec §3.4): stop admitting changes, let
+                // what was admitted finish, announce `app.stopping`, then exit.
+                let state = app.state::<AppState>().inner().clone();
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if !state.admission.drain(std::time::Duration::from_secs(300)).await {
+                        tracing::warn!("drain cap reached; exiting with requests still in flight");
+                    }
+                    events::shutdown(&state, std::time::Duration::from_secs(3)).await;
+                    handle.exit(0);
+                });
+            } else {
+                // A second launch just surfaces the existing instance.
+                show_main_window(app);
+            }
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -419,13 +499,17 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .manage(state.clone())
+        .manage(update::BootInfo::normal())
         .invoke_handler(tauri::generate_handler![
             server_info,
             open_docs,
             install_status,
             install_app,
             uninstall_app,
-            dismiss_install_prompt
+            dismiss_install_prompt,
+            boot_mode,
+            version_notice,
+            ack_version_notice
         ])
         .setup(move |app| {
             // REST API — runs for the app's whole life, window shown or not.

@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Settings written by a newer version are never overwritten: changes are refused with `409 settings_read_only`. @vhidvz
 - A newer version's administrator file keeps the console locked; `posd admin` refuses to change it. @vhidvz
 - The previous installed version is kept for one rollback (`--rollback`). @vhidvz
+- Opening a newer AppImage offers to update the installed copy; the running copy finishes its sale first. @vhidvz
+- `--update`, `--rollback`, `--install --allow-downgrade` and `--version`; `posd --version` too. @vhidvz
 
 ### Changed
 

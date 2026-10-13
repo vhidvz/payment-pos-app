@@ -37,6 +37,56 @@ pub fn plan(
     }
 }
 
+/// What the frontend's `app.vue` asks first (`boot_mode`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootInfo {
+    pub mode: &'static str,
+    pub current: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A copy is running (it owns the single-instance name).
+    pub running: bool,
+}
+
+impl BootInfo {
+    pub fn normal() -> Self {
+        Self::from_boot(&Boot::Normal, false)
+    }
+
+    pub fn from_boot(boot: &Boot, running: bool) -> Self {
+        let base = |mode| Self {
+            mode,
+            current: crate::version::VERSION.to_string(),
+            installed: None,
+            reason: None,
+            detail: None,
+            running,
+        };
+        match boot {
+            Boot::Normal => base("normal"),
+            Boot::UpdateOffer { from } => {
+                Self { installed: from.as_ref().map(|v| v.to_string()), ..base("updateOffer") }
+            }
+            Boot::ReplaceUnknown { reason } => Self {
+                reason: Some(match reason {
+                    UnknownReason::BadVersionKey(_) => "badVersionKey",
+                    UnknownReason::UnreconciledJournal => "unreconciledJournal",
+                }),
+                detail: Some(reason.to_string()),
+                ..base("replaceUnknown")
+            },
+            Boot::NewerInstalled { installed } => {
+                Self { installed: Some(installed.to_string()), ..base("newerInstalled") }
+            }
+        }
+    }
+}
+
 /// Whether two paths name one file — through symlinks and relative paths. A missing path
 /// is never the same file.
 pub fn same_file(a: &Path, b: &Path) -> bool {
@@ -79,6 +129,20 @@ mod tests {
             plan(&v("1.0.1-test"), &Installed::Version(v("1.0.1")), true, false),
             Boot::NewerInstalled { installed: v("1.0.1") }
         );
+    }
+
+    #[test]
+    fn boot_info_names_each_mode() {
+        let info = |b: Boot| BootInfo::from_boot(&b, true);
+        assert_eq!(info(Boot::Normal).mode, "normal");
+        let offer = info(Boot::UpdateOffer { from: Some(v("1.0.0")) });
+        assert_eq!((offer.mode, offer.installed.as_deref(), offer.running), ("updateOffer", Some("1.0.0"), true));
+        assert_eq!(info(Boot::UpdateOffer { from: None }).installed, None, "pre-1.0");
+        let unknown = info(Boot::ReplaceUnknown { reason: UnknownReason::UnreconciledJournal });
+        assert_eq!((unknown.mode, unknown.reason), ("replaceUnknown", Some("unreconciledJournal")));
+        let newer = info(Boot::NewerInstalled { installed: v("2.0.0") });
+        assert_eq!((newer.mode, newer.installed.as_deref()), ("newerInstalled", Some("2.0.0")));
+        assert_eq!(BootInfo::normal().current, crate::version::VERSION);
     }
 
     #[cfg(unix)]
