@@ -2839,6 +2839,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rpassword",
+ "semver",
  "serde",
  "serde_json",
  "serialport",

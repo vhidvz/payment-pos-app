@@ -9,12 +9,14 @@ pub mod activity;
 pub mod events;
 pub mod fsutil;
 pub mod install;
+pub mod migrate;
 pub mod posture;
 pub mod providers;
 pub mod receipts;
 pub mod security;
 pub mod server;
 pub mod settings;
+pub mod version;
 
 use std::sync::Arc;
 
