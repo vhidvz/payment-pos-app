@@ -137,6 +137,7 @@ curl -X POST localhost:4373/api/v1/providers/saman-ssp1126/functions/purchase/in
 | POST | `/api/v1/providers/active/functions/{fn}/invoke` | Run it on the active terminal |
 | GET | `/api/v1/auth/status` | Is a password set, are you locked |
 | POST | `/api/v1/auth/unlock` · `/lock` | Get / give up a token |
+| GET | `/api/v1/events` | Webhooks, receipt signing, delivery state (no secrets) |
 
 **Use generous timeouts** — card operations block until the cardholder acts, up
 to about two minutes. Only one transaction runs per terminal at a time.
@@ -200,6 +201,76 @@ runs as, so a shell as *that* account can edit the terminal address regardless.
 Separate accounts close those doors, `sudo` does not: run the daemon as its own
 user (`User=ledgerpos`) and then `chgrp ledgerpos` + `chmod 640` the password
 file.
+
+## Events and signed receipts
+
+Both optional, both off until an administrator turns them on, and neither
+changes anything an existing integration reads.
+
+**Webhook events** tell a server somewhere else when this machine changes in a
+way that matters to it — the lock opened, the password removed, the terminal
+repointed, browser access widened:
+
+```sh
+sudo posd admin events add https://example.com/hooks/pos            # every event
+sudo posd admin events add https://… --events security.*,settings.changed
+sudo posd admin events list | remove <id> | test [<id>]
+```
+
+`add` prints the signing secret once. Messages follow
+[Standard Webhooks](https://www.standardwebhooks.com) — `webhook-id`,
+`webhook-timestamp`, `webhook-signature: v1,…` — so any server verifies them with
+an existing library. The body is `{ "type", "timestamp", "data" }`:
+
+| Event | When |
+| --- | --- |
+| `app.started` · `app.stopping` | The app starts or quits |
+| `security.unlocked` · `security.locked` | A session is opened or explicitly closed |
+| `security.password_set` · `security.password_cleared` · `security.auto_lock_changed` | `posd admin` changed the lock |
+| `settings.changed` | Any setting changed — `data.changed` names the paths, never the values |
+| `events.config_changed` | Subscriptions changed — sent to the **old** endpoints too (by `posd admin` itself, at once), so a URL cannot be swapped quietly |
+| `receipts.key_changed` | The receipt key was set, rotated or cleared |
+| `webhook.test` | `posd admin events test` |
+
+Every event carries `data.device`: the installation's id and its **posture** —
+whether a password is set, whether the console is unlocked right now, and
+`securityDigest`, a fingerprint of the settings a payment depends on (API
+address, CORS, the active terminal and its configuration). A receiver that
+recorded the fingerprint can tell from *any* later message that the machine is
+no longer set up the way it accepted — including a `settings.json` edited by
+hand while the app was off, which only shows as a new fingerprint in
+`app.started`. Several settings changes in quick succession may arrive as one
+`settings.changed`. Undelivered messages wait in `events-outbox.json` beside the
+settings and are retried (5 s, doubling to 15 min) for 72 hours; redirects are not
+followed. `GET /api/v1/events` shows each URL as scheme and host only, since a
+webhook URL can carry a token.
+
+**Signed receipts** let whoever receives a sale verify that this app produced it:
+
+```sh
+sudo posd admin receipt-key set [--kid <id>]     # prints the key once; again = rotate
+sudo posd admin receipt-key clear
+```
+
+With a key set, every successful `invoke` on the **active** terminal gains
+`attestation`: a JWS (HS256, header `kid`) whose claims are the request's and the
+reply's fields, the device posture taken **before** the operation started,
+`postureChanged` (whether it differed when the operation ended), `iat` and a
+unique `jti`. Calls to any other provider — the built-in sandbox included — are
+never signed. Verify the token with any JWT library and trust its claims rather
+than the JSON around it; a receiver should also want `postureChanged: false`,
+`provider` equal to `posture.activeProvider`, and should store `jti` against its
+own order so one receipt pays for one sale.
+
+**What this proves, and what it cannot.** Both live in the administrator file,
+so an operator who cannot change the password cannot remove them. But the
+secrets are as private as that file: by default every account on the machine
+can read it (`posd admin status` says so) and could sign as this device — run
+the daemon under its own account and narrow the file as *Locking the app*
+describes. An administrator of the machine can always remove them, and a
+stopped app or a cut network sends nothing: **the absence of an event is not
+evidence that nothing changed.** Signed receipts are the stronger of the two,
+because the posture travels with every sale.
 
 ## Troubleshooting
 

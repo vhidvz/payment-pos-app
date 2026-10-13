@@ -6,8 +6,11 @@
 //! start-at-boot syncing, single-instance focus, and a couple of UI commands.
 
 pub mod activity;
+pub mod events;
 pub mod install;
+pub mod posture;
 pub mod providers;
+pub mod receipts;
 pub mod security;
 pub mod server;
 pub mod settings;
@@ -53,7 +56,10 @@ pub fn build_state() -> AppState {
         Arc::new(SandboxProvider::new(cfg(providers::sandbox::PROVIDER_ID))),
     ]));
     let auth = Arc::new(AuthState::new(crate::security::admin_path()));
-    AppState::new(settings, registry, auth)
+    let mut state = AppState::new(settings, registry, auth);
+    // Undelivered webhook messages survive a restart in the real app.
+    state.events = Arc::new(events::EventBus::new(Some(events::EventBus::default_outbox_path())));
+    state
 }
 
 // --------------------------------------------------------- desktop install
@@ -197,7 +203,12 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 let url = ui_server_info(&state).docs_url;
                 let _ = app.opener().open_url(url, None::<&str>);
             }
-            "quit" => app.exit(0),
+            "quit" => {
+                // Best effort: give `app.stopping` a moment to reach its subscribers.
+                let state = app.state::<AppState>().inner().clone();
+                tauri::async_runtime::block_on(events::shutdown(&state, std::time::Duration::from_secs(3)));
+                app.exit(0)
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -403,6 +414,8 @@ pub fn run() {
         .setup(move |app| {
             // REST API — runs for the app's whole life, window shown or not.
             tauri::async_runtime::spawn(server::run_server(state.clone()));
+            // Webhook events: idle unless an administrator configured a subscription.
+            tauri::async_runtime::spawn(events::run(state.clone()));
 
             build_tray(app)?;
 

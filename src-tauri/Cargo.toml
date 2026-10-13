@@ -43,6 +43,14 @@ async-trait = "0.1"
 argon2 = "0.6"
 rpassword = "7"
 libc = "0.2.189"
+# Webhook events and signed receipts (src/events.rs, src/receipts.rs). `reqwest` and `sha2`
+# were already in the tree through Tauri; `native-tls` uses the system's TLS (OpenSSL on Linux,
+# already a build prerequisite) rather than compiling a second crypto stack.
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

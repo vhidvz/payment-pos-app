@@ -14,6 +14,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::ToSchema;
 
 use crate::activity::ActivityLog;
+use crate::events::EventBus;
 use crate::providers::ProviderRegistry;
 use crate::security::AuthState;
 use crate::settings::{ServerSettings, SettingsStore};
@@ -47,6 +48,9 @@ pub struct AppState {
     /// Lock state: the administrator's password file plus live sessions.
     pub auth: Arc<AuthState>,
     pub activity: Arc<ActivityLog>,
+    /// Webhook events ([`crate::events`]). In memory unless the caller swaps in a
+    /// persistent bus, which [`crate::build_state`] does for the real app.
+    pub events: Arc<EventBus>,
     pub started_at: std::time::Instant,
     pub server_status: Arc<RwLock<ServerStatus>>,
 }
@@ -62,6 +66,7 @@ impl AppState {
             registry,
             auth,
             activity: Arc::new(ActivityLog::default()),
+            events: Arc::new(EventBus::new(None)),
             started_at: std::time::Instant::now(),
             server_status: Arc::new(RwLock::new(ServerStatus::default())),
         }

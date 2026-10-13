@@ -17,6 +17,9 @@ use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier}
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 
+use crate::events::{generate_secret, EventsConfig, Subscription};
+use crate::receipts::ReceiptKey;
+
 pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 15;
 pub const MIN_PASSWORD_LEN: usize = 4;
 
@@ -27,11 +30,21 @@ pub struct AdminConfig {
     pub password_hash: Option<String>,
     /// Idle minutes before an unlocked session re-locks. 0 disables expiry.
     pub auto_lock_minutes: u32,
+    /// Webhook subscriptions ([`crate::events`]). Here rather than in settings so an
+    /// operator who cannot change the password cannot silence them either.
+    pub events: EventsConfig,
+    /// The key that signs receipts ([`crate::receipts`]); `None` leaves them unsigned.
+    pub receipt_key: Option<ReceiptKey>,
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
-        Self { password_hash: None, auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES }
+        Self {
+            password_hash: None,
+            auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
+            events: EventsConfig::default(),
+            receipt_key: None,
+        }
     }
 }
 
@@ -63,16 +76,48 @@ fn default_admin_path() -> PathBuf {
 /// Read the administrator file. A missing or unreadable file means "no password
 /// set" — the app must stay usable, not refuse to start, when it is absent.
 pub fn load_from(path: &Path) -> AdminConfig {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return AdminConfig::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_else(|e| {
-        tracing::warn!(
-            "administrator file {} is unreadable ({e}); treating it as no password set",
-            path.display()
-        );
+    try_load_from(path).unwrap_or_else(|e| {
+        tracing::warn!("{e}; treating it as no password set");
         AdminConfig::default()
     })
+}
+
+/// The administrator file, or why it could not be read. A missing file is not an
+/// error — it is the default, an open app.
+///
+/// **The optional sections are read leniently.** A webhook subscription or a
+/// receipt key is a nested record a person may edit by hand, and a strict read
+/// would let one bad entry fail the whole file — which [`load_from`] turns into
+/// "no password set". So a bad entry is dropped with a warning, and only a file
+/// that is not JSON at all, or whose password section is malformed, is an error.
+pub fn try_load_from(path: &Path) -> Result<AdminConfig, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AdminConfig::default()),
+        Err(e) => return Err(format!("administrator file {} is unreadable ({e})", path.display())),
+    };
+    let unreadable = |e: String| format!("administrator file {} is unreadable ({e})", path.display());
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).map_err(|e| unreadable(e.to_string()))?;
+    let events = doc.as_object_mut().and_then(|o| o.remove("events"));
+    let receipt_key = doc.as_object_mut().and_then(|o| o.remove("receiptKey"));
+    let mut cfg: AdminConfig = serde_json::from_value(doc).map_err(|e| unreadable(e.to_string()))?;
+
+    if let Some(events) = events {
+        cfg.events.device_id = events.get("deviceId").and_then(|v| v.as_str()).map(String::from);
+        for entry in events.get("subscriptions").and_then(|v| v.as_array()).into_iter().flatten() {
+            match serde_json::from_value::<Subscription>(entry.clone()) {
+                Ok(sub) => cfg.events.subscriptions.push(sub),
+                Err(e) => tracing::warn!("ignoring a malformed event subscription in {} ({e})", path.display()),
+            }
+        }
+    }
+    if let Some(key) = receipt_key.filter(|v| !v.is_null()) {
+        match serde_json::from_value::<ReceiptKey>(key) {
+            Ok(key) => cfg.receipt_key = Some(key),
+            Err(e) => tracing::warn!("ignoring a malformed receipt key in {} ({e}); receipts go unsigned", path.display()),
+        }
+    }
+    Ok(cfg)
 }
 
 pub fn save_to(path: &Path, cfg: &AdminConfig) -> std::io::Result<()> {
@@ -80,15 +125,34 @@ pub fn save_to(path: &Path, cfg: &AdminConfig) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let json = serde_json::to_string_pretty(cfg).expect("admin config serialize");
-    std::fs::write(path, json)?;
+    let previous = std::fs::metadata(path).ok();
+    // Write-then-rename: the running app re-reads this file every few seconds, and a
+    // half-written one would read as "no password set" for that moment.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
     // The app runs unprivileged and must be able to read this to verify a
     // password; only root may write it. An administrator running the daemon under
     // its own account can narrow this further (see `posd admin status`).
+    //
+    // **The existing mode and owner are kept; 0644 is only for a new file.** This
+    // used to re-apply 0644 on every write, so an administrator who narrowed the
+    // file to 0640 — as `status` advises, and as the webhook secrets and the receipt
+    // key now need — had it widened again by the next `set-password`, silently.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        match &previous {
+            Some(meta) => {
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+                // Only root can give a file away; as anyone else the owner is already ours.
+                let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
+            }
+            None => std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?,
+        }
     }
+    #[cfg(not(unix))]
+    let _ = &previous;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -178,10 +242,21 @@ impl AuthState {
         }
     }
 
+    /// Where this state reads the administrator file from.
+    pub fn admin_file_path(&self) -> &Path {
+        &self.admin_file
+    }
+
     /// Re-read on every use so `sudo posd admin set-password` takes effect without
     /// restarting the daemon. The file is a few dozen bytes and auth is rare.
     pub fn admin(&self) -> AdminConfig {
         load_from(&self.admin_file)
+    }
+
+    /// [`Self::admin`] without the fallback — for a reader that must tell "the file
+    /// says no password" apart from "the file could not be read just now".
+    pub fn try_admin(&self) -> Result<AdminConfig, String> {
+        try_load_from(&self.admin_file)
     }
 
     pub fn password_set(&self) -> bool {
@@ -216,9 +291,28 @@ impl AuthState {
         Ok(token)
     }
 
-    /// Drop one session.
-    pub fn lock(&self, token: &str) {
-        self.sessions.lock().expect("sessions").remove(token);
+    /// Drop one session. `true` when there was one to drop.
+    pub fn lock(&self, token: &str) -> bool {
+        self.sessions.lock().expect("sessions").remove(token).is_some()
+    }
+
+    /// Whether protected changes can be made right now by *someone*: no password
+    /// is set, or at least one session is still valid. The device-level answer a
+    /// webhook receiver or a receipt verifier needs — [`Self::is_unlocked`] answers
+    /// it for one caller.
+    pub fn any_unlocked(&self) -> bool {
+        let admin = self.admin();
+        let Some(current) = admin.password_hash.as_deref() else {
+            return true;
+        };
+        let window = (admin.auto_lock_minutes > 0)
+            .then(|| Duration::from_secs(u64::from(admin.auto_lock_minutes) * 60));
+        let now = Instant::now();
+        self.sessions
+            .lock()
+            .expect("sessions")
+            .values()
+            .any(|s| session_valid(s, current, window, now))
     }
 
     /// True when the caller may perform a protected action. Refreshes the
@@ -268,6 +362,7 @@ mod session_tests {
             &AdminConfig {
                 password_hash: Some(hash_password(pw).unwrap()),
                 auto_lock_minutes,
+                ..AdminConfig::default()
             },
         )
         .unwrap();
@@ -378,6 +473,7 @@ mod session_tests {
             &AdminConfig {
                 password_hash: Some(hash_password("second").unwrap()),
                 auto_lock_minutes: 15,
+                ..AdminConfig::default()
             },
         )
         .unwrap();
@@ -406,6 +502,15 @@ pub enum AdminCommand {
     ClearPassword,
     AutoLock(u32),
     Status,
+    /// `events add <url> [--events a,b]`
+    EventsAdd { url: String, events: Vec<String> },
+    EventsList,
+    EventsRemove(String),
+    /// `events test [<id>]` — every subscription when no id is given.
+    EventsTest(Option<String>),
+    /// `receipt-key set [--kid <kid>]`
+    ReceiptKeySet(Option<String>),
+    ReceiptKeyClear,
 }
 
 /// Parse the arguments after the binary name. `None` means "not an admin
@@ -414,11 +519,20 @@ pub fn parse_admin_command(args: &[String]) -> Option<Result<AdminCommand, Strin
     if args.first().map(String::as_str) != Some("admin") {
         return None;
     }
-    const USAGE: &str = "usage: posd admin <set-password|clear-password|auto-lock <minutes>|status>";
+    const USAGE: &str = "usage: posd admin <set-password|clear-password|auto-lock <minutes>|status>\n\
+       posd admin events <add <url> [--events <type,prefix.*,…>]|list|remove <id>|test [<id>]>\n\
+       posd admin receipt-key <set [--kid <id>]|clear>";
     Some(match args.get(1).map(String::as_str) {
         Some("set-password") => Ok(AdminCommand::SetPassword),
         Some("clear-password") => Ok(AdminCommand::ClearPassword),
         Some("status") => Ok(AdminCommand::Status),
+        Some("events") => parse_events(&args[2..]).map_err(|e| format!("{e}\n{USAGE}")),
+        Some("receipt-key") => match (args.get(2).map(String::as_str), args.get(3).map(String::as_str), args.get(4)) {
+            (Some("set"), None, None) => Ok(AdminCommand::ReceiptKeySet(None)),
+            (Some("set"), Some("--kid"), Some(kid)) if !kid.trim().is_empty() => Ok(AdminCommand::ReceiptKeySet(Some(kid.trim().to_string()))),
+            (Some("clear"), None, None) => Ok(AdminCommand::ReceiptKeyClear),
+            _ => Err(format!("receipt-key takes 'set [--kid <id>]' or 'clear'\n{USAGE}")),
+        },
         Some("auto-lock") => match args.get(2) {
             Some(v) => v
                 .parse::<u32>()
@@ -431,9 +545,102 @@ pub fn parse_admin_command(args: &[String]) -> Option<Result<AdminCommand, Strin
     })
 }
 
+fn parse_events(rest: &[String]) -> Result<AdminCommand, String> {
+    match rest.first().map(String::as_str) {
+        Some("add") => {
+            let url = rest.get(1).ok_or("events add needs a URL")?.trim().to_string();
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Err(format!("'{url}' is not an http(s) URL"));
+            }
+            let events = match (rest.get(2).map(String::as_str), rest.get(3)) {
+                (None, _) => vec!["*".to_string()],
+                (Some("--events"), Some(list)) => {
+                    let parsed: Vec<String> =
+                        list.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
+                    for e in &parsed {
+                        let known = e == "*"
+                            || crate::events::types::ALL.contains(&e.as_str())
+                            || e.strip_suffix(".*").is_some_and(|p| {
+                                crate::events::types::ALL.iter().any(|t| t.starts_with(&format!("{p}.")))
+                            });
+                        if !known {
+                            return Err(format!(
+                                "'{e}' matches no event type; known: {}",
+                                crate::events::types::ALL.join(", ")
+                            ));
+                        }
+                    }
+                    if parsed.is_empty() {
+                        return Err("--events needs at least one type".into());
+                    }
+                    parsed
+                }
+                _ => return Err("events add takes '<url> [--events <list>]'".into()),
+            };
+            Ok(AdminCommand::EventsAdd { url, events })
+        }
+        Some("list") if rest.len() == 1 => Ok(AdminCommand::EventsList),
+        Some("remove") => rest
+            .get(1)
+            .map(|id| AdminCommand::EventsRemove(id.trim().to_string()))
+            .ok_or_else(|| "events remove needs a subscription id".to_string()),
+        Some("test") => Ok(AdminCommand::EventsTest(rest.get(1).map(|s| s.trim().to_string()))),
+        _ => Err("events takes add, list, remove or test".into()),
+    }
+}
+
+/// Mint the installation's device id the first time something needs it.
+fn ensure_device_id(cfg: &mut AdminConfig) {
+    if cfg.events.device_id.is_none() {
+        cfg.events.device_id = Some(format!("dev_{}", uuid::Uuid::new_v4().simple()));
+    }
+}
+
+/// Add a webhook subscription; answers it **with its secret**, which is shown once.
+pub fn add_subscription_at(path: &Path, url: &str, events: Vec<String>) -> Result<Subscription, String> {
+    let sub = Subscription {
+        id: format!("sub_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+        url: url.to_string(),
+        secret: generate_secret()?,
+        events,
+        enabled: true,
+    };
+    let added = sub.clone();
+    amend(path, |cfg| {
+        ensure_device_id(cfg);
+        cfg.events.subscriptions.push(sub);
+    })?;
+    Ok(added)
+}
+
+pub fn remove_subscription_at(path: &Path, id: &str) -> Result<(), String> {
+    if !load_from(path).events.subscriptions.iter().any(|s| s.id == id) {
+        return Err(format!("no subscription '{id}' (see `posd admin events list`)"));
+    }
+    amend(path, |cfg| cfg.events.subscriptions.retain(|s| s.id != id))
+}
+
+/// Set — or rotate — the receipt key; answers it **with its secret**, shown once.
+pub fn set_receipt_key_at(path: &Path, kid: Option<String>) -> Result<ReceiptKey, String> {
+    let key = ReceiptKey::generate(kid)?;
+    let set = key.clone();
+    amend(path, |cfg| {
+        ensure_device_id(cfg);
+        cfg.receipt_key = Some(key);
+    })?;
+    Ok(set)
+}
+
+pub fn clear_receipt_key_at(path: &Path) -> Result<(), String> {
+    amend(path, |cfg| cfg.receipt_key = None)
+}
+
 /// Read-modify-write of the administrator file, so one setting never clobbers another.
 fn amend(path: &Path, change: impl FnOnce(&mut AdminConfig)) -> Result<(), String> {
-    let mut cfg = load_from(path);
+    // Never write over a file that did not parse: `load_from` would hand back the
+    // defaults, and writing them would erase the password hash for good.
+    let mut cfg = try_load_from(path)
+        .map_err(|e| format!("{e}; fix or remove it by hand — nothing was changed"))?;
     change(&mut cfg);
     save_to(path, &cfg).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
@@ -468,21 +675,41 @@ pub fn status_report(path: &Path) -> String {
         m => format!("auto-lock          : {m} minutes idle\n"),
     });
 
+    if let Some(device) = &cfg.events.device_id {
+        out.push_str(&format!("device id          : {device}\n"));
+    }
+    out.push_str(&match cfg.events.subscriptions.len() {
+        0 => "event webhooks     : none\n".to_string(),
+        n => format!("event webhooks     : {n} (posd admin events list)\n"),
+    });
+    out.push_str(&match &cfg.receipt_key {
+        Some(k) => format!("signed receipts    : on, key id {}\n", k.kid),
+        None => "signed receipts    : off\n".to_string(),
+    });
+
+    let holds_secrets = !cfg.events.subscriptions.is_empty() || cfg.receipt_key.is_some();
     #[cfg(unix)]
-    if cfg.password_hash.is_some() {
+    if cfg.password_hash.is_some() || holds_secrets {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode() & 0o777;
             out.push_str(&format!("permissions        : {mode:04o}\n"));
             if mode & 0o004 != 0 {
-                out.push_str(
+                out.push_str(if holds_secrets {
+                    "\nThe webhook secrets and the receipt key are readable by every user on this\n\
+                     machine, so anyone here could sign a message as this device. If the daemon\n\
+                     runs under its own account, narrow it:\n\
+                     \n    sudo chgrp <daemon-user> <file> && sudo chmod 640 <file>\n"
+                } else {
                     "\nThe hash is readable by every user on this machine, which allows an\n\
                      offline guessing attack. If the daemon runs under its own account, narrow it:\n\
-                     \n    sudo chgrp <daemon-user> <file> && sudo chmod 640 <file>\n",
-                );
+                     \n    sudo chgrp <daemon-user> <file> && sudo chmod 640 <file>\n"
+                });
             }
         }
     }
+    #[cfg(not(unix))]
+    let _ = holds_secrets;
     out
 }
 
@@ -606,6 +833,7 @@ mod tests {
         let cfg = AdminConfig {
             password_hash: Some(hash_password("correct horse").unwrap()),
             auto_lock_minutes: 5,
+            ..AdminConfig::default()
         };
         save_to(&p, &cfg).unwrap();
 
@@ -642,3 +870,150 @@ mod tests {
         assert!(hash_password("abcd").is_ok());
     }
 }
+
+#[cfg(test)]
+mod events_admin_tests {
+    use super::*;
+
+    fn tmp_admin() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ledger-pos-ev-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("admin.json")
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn events_and_receipt_key_commands_parse() {
+        assert_eq!(
+            parse_admin_command(&args(&["admin", "events", "add", "https://h/x"])),
+            Some(Ok(AdminCommand::EventsAdd { url: "https://h/x".into(), events: vec!["*".into()] }))
+        );
+        assert_eq!(
+            parse_admin_command(&args(&["admin", "events", "add", "https://h/x", "--events", "security.*, settings.changed"])),
+            Some(Ok(AdminCommand::EventsAdd {
+                url: "https://h/x".into(),
+                events: vec!["security.*".into(), "settings.changed".into()]
+            }))
+        );
+        assert_eq!(parse_admin_command(&args(&["admin", "events", "list"])), Some(Ok(AdminCommand::EventsList)));
+        assert_eq!(parse_admin_command(&args(&["admin", "events", "remove", "sub_1"])), Some(Ok(AdminCommand::EventsRemove("sub_1".into()))));
+        assert_eq!(parse_admin_command(&args(&["admin", "events", "test"])), Some(Ok(AdminCommand::EventsTest(None))));
+        assert_eq!(parse_admin_command(&args(&["admin", "receipt-key", "set"])), Some(Ok(AdminCommand::ReceiptKeySet(None))));
+        assert_eq!(
+            parse_admin_command(&args(&["admin", "receipt-key", "set", "--kid", "shop-7"])),
+            Some(Ok(AdminCommand::ReceiptKeySet(Some("shop-7".into()))))
+        );
+        assert_eq!(parse_admin_command(&args(&["admin", "receipt-key", "clear"])), Some(Ok(AdminCommand::ReceiptKeyClear)));
+    }
+
+    #[test]
+    fn a_typo_in_an_event_type_or_a_non_http_url_is_refused() {
+        assert!(matches!(parse_admin_command(&args(&["admin", "events", "add", "https://h", "--events", "securty.*"])), Some(Err(_))));
+        assert!(matches!(parse_admin_command(&args(&["admin", "events", "add", "ftp://h"])), Some(Err(_))));
+        assert!(matches!(parse_admin_command(&args(&["admin", "events", "add"])), Some(Err(_))));
+        assert!(matches!(parse_admin_command(&args(&["admin", "receipt-key", "set", "--kid"])), Some(Err(_))));
+    }
+
+    #[test]
+    fn adding_and_removing_a_subscription_keeps_the_rest_of_the_file() {
+        let p = tmp_admin();
+        set_auto_lock_at(&p, 7).unwrap();
+        let sub = add_subscription_at(&p, "https://h/x", vec!["*".into()]).unwrap();
+        let cfg = load_from(&p);
+        assert_eq!(cfg.auto_lock_minutes, 7);
+        assert_eq!(cfg.events.subscriptions, vec![sub.clone()]);
+        assert!(cfg.events.device_id.as_deref().is_some_and(|d| d.starts_with("dev_")));
+        assert!(remove_subscription_at(&p, "nope").is_err());
+        remove_subscription_at(&p, &sub.id).unwrap();
+        assert!(load_from(&p).events.subscriptions.is_empty());
+        assert_eq!(load_from(&p).events.device_id, cfg.events.device_id, "the device keeps its id");
+    }
+
+    #[test]
+    fn a_receipt_key_is_set_rotated_and_cleared() {
+        let p = tmp_admin();
+        let a = set_receipt_key_at(&p, Some("k1".into())).unwrap();
+        let b = set_receipt_key_at(&p, None).unwrap();
+        assert_ne!(a.secret, b.secret);
+        assert_eq!(load_from(&p).receipt_key, Some(b));
+        clear_receipt_key_at(&p).unwrap();
+        assert_eq!(load_from(&p).receipt_key, None);
+    }
+
+    /// `save_to` used to re-apply 0644 on every write, widening a file the
+    /// administrator had narrowed — the secrets now kept here depend on it.
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_a_narrowed_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp_admin();
+        set_auto_lock_at(&p, 5).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o644, "created 0644");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        set_auto_lock_at(&p, 6).unwrap();
+        add_subscription_at(&p, "https://h/x", vec!["*".into()]).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o640, "narrowing survives writes");
+    }
+
+    #[test]
+    fn an_old_admin_file_without_the_new_fields_still_loads() {
+        let p = tmp_admin();
+        std::fs::write(&p, r#"{"passwordHash":null,"autoLockMinutes":3}"#).unwrap();
+        let cfg = load_from(&p);
+        assert_eq!(cfg.auto_lock_minutes, 3);
+        assert!(cfg.events.subscriptions.is_empty() && cfg.receipt_key.is_none());
+    }
+
+    #[test]
+    fn status_names_events_and_receipts() {
+        let p = tmp_admin();
+        add_subscription_at(&p, "https://h/x", vec!["*".into()]).unwrap();
+        set_receipt_key_at(&p, Some("k9".into())).unwrap();
+        let report = status_report(&p);
+        assert!(report.contains("event webhooks     : 1"));
+        assert!(report.contains("key id k9"));
+        assert!(report.contains("anyone here could sign a message"), "world-readable secrets are called out:\n{report}");
+    }
+
+    /// One bad hand edit of a webhook entry used to fail the whole file — which
+    /// `load_from` reads as "no password" — and the next `posd admin` write made
+    /// that permanent.
+    #[test]
+    fn a_malformed_subscription_is_dropped_and_the_password_survives() {
+        let p = tmp_admin();
+        std::fs::write(
+            &p,
+            r#"{"passwordHash":"$argon2id$x","autoLockMinutes":4,
+                "events":{"deviceId":"dev_1","subscriptions":[{"id":"ok","url":"https://h","secret":"whsec_AAAA"},{"url":"broken"}]},
+                "receiptKey":{"kid":"k"}}"#,
+        )
+        .unwrap();
+        let cfg = try_load_from(&p).unwrap();
+        assert_eq!(cfg.password_hash.as_deref(), Some("$argon2id$x"));
+        assert_eq!(cfg.auto_lock_minutes, 4);
+        assert_eq!(cfg.events.device_id.as_deref(), Some("dev_1"));
+        assert_eq!(cfg.events.subscriptions.len(), 1, "the good entry stays, the broken one goes");
+        assert!(cfg.receipt_key.is_none(), "a key without its secret signs nothing");
+    }
+
+    #[test]
+    fn a_write_never_lands_on_a_file_that_did_not_parse() {
+        let p = tmp_admin();
+        std::fs::write(&p, "{ this is not json").unwrap();
+        assert!(set_auto_lock_at(&p, 9).is_err());
+        assert!(add_subscription_at(&p, "https://h", vec!["*".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{ this is not json", "left exactly as it was");
+        assert!(try_load_from(&p).is_err());
+        assert_eq!(load_from(&p), AdminConfig::default(), "the app itself still starts, open");
+    }
+
+    #[test]
+    fn a_missing_file_is_the_default_not_an_error() {
+        let p = tmp_admin();
+        assert_eq!(try_load_from(&p).unwrap(), AdminConfig::default());
+    }
+}
+
