@@ -391,6 +391,11 @@ fn recover_locked(layout: &Layout) -> Result<Recovered, RecoverError> {
 
 /// Finish whatever commit a crash interrupted; run before every boot decision.
 pub fn recover(layout: &Layout) -> Result<Recovered, RecoverError> {
+    // No state directory: nothing was ever installed this way (a package install, Windows),
+    // so there is nothing to recover — and taking the lock would create one.
+    if !layout.state.exists() {
+        return Ok(Recovered::Nothing);
+    }
     let _lock = InstallLock::acquire(layout).map_err(rio)?;
     recover_locked(layout)
 }
@@ -464,6 +469,16 @@ mod tests {
         f.extend((0..n).map(Fault::AfterRename));
         f.push(Fault::AfterJournalDeleted);
         f
+    }
+
+    /// Every start runs `recover`; on a machine that never installed the AppImage (a
+    /// package install, Windows) it must leave no installer state behind.
+    #[test]
+    fn recovery_where_nothing_was_ever_installed_creates_nothing() {
+        let r = root();
+        let l = layout(&r);
+        assert_eq!(recover(&l).unwrap(), Recovered::Nothing);
+        assert!(!l.state.exists(), "{} was created", l.state.display());
     }
 
     #[test]
