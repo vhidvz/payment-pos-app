@@ -115,7 +115,10 @@ does, on purpose.
 Either way your settings carry over. On the first start each data file is brought up to date and
 the original is kept beside it as `<file>.v<N>.bak`; the console says once what changed. A file
 written by a *newer* version is never overwritten — settings turn read-only, and a newer
-administrator file keeps the console locked — so going back a version cannot lose data.
+administrator file keeps the console locked — so going back a version never overwrites what the
+newer one wrote. One exception: a version from before 1.0 cannot read the 1.0 webhook outbox and
+sets it aside as `events-outbox.json.invalid`, so deliveries still queued at that moment are not
+sent.
 
 ## Setup
 
