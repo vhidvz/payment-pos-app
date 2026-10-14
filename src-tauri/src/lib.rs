@@ -464,6 +464,18 @@ fn run_update_mode(boot: update::Boot, layout: install::Layout) {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title("Update Ledger POS");
                 let _ = window.show();
+                // End-to-end builds only: click an element by CSS selector through the
+                // webview itself, so the harness drives the real button → command → events
+                // path. Injected pointer input does not reach windows on every desktop.
+                #[cfg(feature = "e2e")]
+                if let Ok(selector) = std::env::var("LEDGER_POS_E2E_CLICK") {
+                    let window = window.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                        let js = format!("document.querySelector({selector:?})?.click()");
+                        let _ = window.eval(&js);
+                    });
+                }
             }
             Ok(())
         })
