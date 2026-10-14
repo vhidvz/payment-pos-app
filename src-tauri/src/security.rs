@@ -111,6 +111,9 @@ pub struct AdminRead {
     pub schema: u32,
     /// `Some(found)` when a newer version wrote it — the console must stay locked.
     pub newer: Option<u32>,
+    /// `Some(why)` when `schemaVersion` is there but is not a version (a hand edit): the
+    /// key is ignored for reading, as before 1.0, and the file is never written back.
+    pub invalid_schema: Option<String>,
 }
 
 /// The administrator file, migrated in memory (spec §2.3). Never writes: the app runs
@@ -119,21 +122,31 @@ pub fn read_admin(path: &Path) -> Result<AdminRead, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AdminRead { cfg: AdminConfig::default(), schema: ADMIN_SCHEMA, newer: None })
+            return Ok(AdminRead { cfg: AdminConfig::default(), schema: ADMIN_SCHEMA, newer: None, invalid_schema: None })
         }
         Err(e) => return Err(format!("administrator file {} is unreadable ({e})", path.display())),
     };
     let unreadable = |e: String| format!("administrator file {} is unreadable ({e})", path.display());
     let mut doc: serde_json::Value = serde_json::from_str(&raw).map_err(|e| unreadable(e.to_string()))?;
-    let schema = crate::migrate::schema_of(&doc).map_err(|e| unreadable(e.to_string()))?;
-    let newer = match crate::migrate::upgrade(&mut doc, ADMIN_STEPS) {
-        Ok(_) => None,
-        Err(crate::migrate::MigrateError::Newer { found, .. }) => Some(found),
-        Err(e) => return Err(unreadable(e.to_string())),
+    let (schema, newer, invalid_schema) = match crate::migrate::schema_of(&doc) {
+        Ok(found) => match crate::migrate::upgrade(&mut doc, ADMIN_STEPS) {
+            Ok(_) => (found, None, None),
+            Err(crate::migrate::MigrateError::Newer { found, .. }) => (found, Some(found), None),
+            Err(e) => return Err(unreadable(e.to_string())),
+        },
+        // Not a version: ignore the key for reading, as every version before 1.0 did, so
+        // the password stays enforced. It is never read as 0 and never written back.
+        Err(e) => (0, None, Some(e.to_string())),
     };
     crate::migrate::strip(&mut doc);
-    let cfg = parse_lenient(path, doc).map_err(unreadable)?;
-    Ok(AdminRead { cfg, schema, newer })
+    let cfg = match parse_lenient(path, doc) {
+        Ok(cfg) => cfg,
+        // A newer file this version cannot parse still keeps the console locked: fail-closed
+        // must not depend on later versions keeping the step contract.
+        Err(_) if newer.is_some() => AdminConfig::default(),
+        Err(e) => return Err(unreadable(e)),
+    };
+    Ok(AdminRead { cfg, schema, newer, invalid_schema })
 }
 
 /// See [`try_load_from`]: one bad webhook or key entry is dropped with a warning instead
@@ -295,7 +308,7 @@ impl AuthState {
     fn admin_read(&self) -> AdminRead {
         read_admin(&self.admin_file).unwrap_or_else(|e| {
             tracing::warn!("{e}; treating it as no password set");
-            AdminRead { cfg: AdminConfig::default(), schema: 0, newer: None }
+            AdminRead { cfg: AdminConfig::default(), schema: 0, newer: None, invalid_schema: None }
         })
     }
 
@@ -703,6 +716,12 @@ fn amend(path: &Path, change: impl FnOnce(&mut AdminConfig)) -> Result<(), Strin
             path.display()
         ));
     }
+    if let Some(why) = &read.invalid_schema {
+        return Err(format!(
+            "{}: its schemaVersion is not a version ({why}); fix or remove that key by hand — nothing was changed",
+            path.display()
+        ));
+    }
     let mut cfg = read.cfg;
     change(&mut cfg);
     // The first write in the new schema keeps the original, with its mode and owner —
@@ -733,10 +752,19 @@ pub fn set_auto_lock_at(path: &Path, minutes: u32) -> Result<(), String> {
 
 /// Human-readable summary of the administrator file.
 pub fn status_report(path: &Path) -> String {
-    let read = read_admin(path).unwrap_or(AdminRead { cfg: AdminConfig::default(), schema: 0, newer: None });
+    let read = read_admin(path).unwrap_or(AdminRead {
+        cfg: AdminConfig::default(),
+        schema: 0,
+        newer: None,
+        invalid_schema: None,
+    });
     let cfg = read.cfg;
     let mut out = format!("administrator file : {}\n", path.display());
     out.push_str(&match (read.newer, read.schema) {
+        _ if read.invalid_schema.is_some() => format!(
+            "schema             : invalid ({}) — this posd will not change the file\n",
+            read.invalid_schema.as_deref().unwrap_or_default()
+        ),
         (Some(n), _) => format!("schema             : {n} — written by a newer Ledger POS; this posd will not change it\n"),
         (None, s) if s < ADMIN_SCHEMA => format!("schema             : {s} — upgraded to {ADMIN_SCHEMA} by the next change\n"),
         (None, s) => format!("schema             : {s}\n"),
@@ -1170,6 +1198,39 @@ mod schema_tests {
         let p = d.join("admin.json");
         std::fs::write(&p, r#"{"autoLockMinutes":7}"#).unwrap();
         assert!(status_report(&p).contains("schema             : 0 — upgraded to 1 by the next change"));
+    }
+
+    /// A newer file whose known fields no longer parse (a type changed) must still keep the
+    /// console locked — fail-closed cannot depend on later versions keeping the contract.
+    #[tokio::test]
+    async fn a_newer_admin_file_that_does_not_parse_still_fails_closed() {
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        std::fs::write(&p, r#"{"schemaVersion":5,"autoLockMinutes":"soon","passwordHash":7}"#).unwrap();
+        let auth = AuthState::new(p.clone());
+        assert_eq!(auth.admin_file_newer(), Some(5));
+        assert!(!auth.is_unlocked(None));
+        assert!(!auth.any_unlocked());
+        assert_eq!(auth.unlock("anything").await, Err(UnlockError::AdminFileNewer(5)));
+    }
+
+    /// A hand-edited schemaVersion that is not a version is ignored for reading, as every
+    /// version before 1.0 ignored the key — the password stays enforced — and is never
+    /// written back.
+    #[tokio::test]
+    async fn an_invalid_schema_version_keeps_the_password_enforced() {
+        let d = admin_dir();
+        let p = d.join("admin.json");
+        let raw = format!(r#"{{"schemaVersion":"1","passwordHash":"{}"}}"#, hash_password("secret").unwrap());
+        std::fs::write(&p, &raw).unwrap();
+        let auth = AuthState::new(p.clone());
+        assert!(auth.password_set());
+        assert!(!auth.is_unlocked(None), "locked: the hash is still read");
+        assert!(auth.unlock("secret").await.is_ok());
+        let err = set_auto_lock_at(&p, 3).unwrap_err();
+        assert!(err.contains("schemaVersion"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), raw, "never written back");
+        assert!(status_report(&p).contains("schema             : invalid"));
     }
 
     #[cfg(not(feature = "e2e"))]
