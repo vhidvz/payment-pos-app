@@ -13,8 +13,8 @@ use tokio::sync::watch;
 use utoipa::ToSchema;
 
 use crate::migrate::{
-    commit_upgrade, keep_invalid, read_and_upgrade, record, stamp, FileStatus, Loaded, MigrateLock,
-    MigrationRecord, Outcome, Step,
+    commit_upgrade, keep_invalid, newer_message, newer_on_disk, read_and_upgrade, record, stamp,
+    FileStatus, Loaded, MigrateLock, MigrationRecord, Outcome, Step,
 };
 
 pub const SETTINGS_SCHEMA: u32 = 1;
@@ -154,9 +154,10 @@ pub fn settings_path() -> PathBuf {
 pub struct SettingsStore {
     path: PathBuf,
     tx: watch::Sender<Settings>,
-    status: FileStatus,
-    /// Why writes are refused, when the file belongs to a newer version.
-    read_only: Option<String>,
+    status: std::sync::Mutex<FileStatus>,
+    /// Why writes are refused, when the file belongs to a newer version — set at load, or
+    /// later when a write finds a newer version migrated the file underneath this process.
+    read_only: std::sync::Mutex<Option<String>>,
     migrations: Vec<MigrationRecord>,
 }
 
@@ -194,11 +195,7 @@ impl SettingsStore {
                 Err(e) => recovered(&path, &e.to_string()),
             },
             Loaded::Newer { doc, found, supported } => {
-                let why = format!(
-                    "{} was written by a newer Ledger POS (schema {found}; this version understands \
-                     {supported}) — open that version, or restore a .bak backup beside it",
-                    path.display()
-                );
+                let why = newer_message(&path, found, supported);
                 tracing::warn!("{why}; settings are read-only this run");
                 let s = serde_json::from_value::<Settings>(doc).unwrap_or_default();
                 (s, FileStatus::ReadOnlyNewer, Some(why))
@@ -206,11 +203,26 @@ impl SettingsStore {
             Loaded::Broken(e) => recovered(&path, &e),
         };
         let (tx, _) = watch::channel(settings);
-        Self { path, tx, status, read_only, migrations }
+        Self {
+            path,
+            tx,
+            status: std::sync::Mutex::new(status),
+            read_only: std::sync::Mutex::new(read_only),
+            migrations,
+        }
     }
 
     pub fn status(&self) -> FileStatus {
-        self.status
+        *self.status.lock().expect("settings status")
+    }
+
+    /// From now on this file belongs to a newer version: refuse every write.
+    fn mark_read_only(&self, found: u32) -> String {
+        let why = newer_message(&self.path, found, SETTINGS_SCHEMA);
+        tracing::warn!("{why}; settings are read-only from now on");
+        *self.read_only.lock().expect("settings read-only") = Some(why.clone());
+        *self.status.lock().expect("settings status") = FileStatus::ReadOnlyNewer;
+        why
     }
 
     /// The migrations this store performed while loading.
@@ -218,11 +230,15 @@ impl SettingsStore {
         self.migrations.clone()
     }
 
+    /// Refuse when the file belongs to a newer version — as loaded, or as it is on disk now.
     pub fn ensure_writable(&self) -> Result<(), SettingsError> {
-        match &self.read_only {
-            Some(why) => Err(SettingsError::ReadOnly(why.clone())),
-            None => Ok(()),
+        if let Some(why) = self.read_only.lock().expect("settings read-only").clone() {
+            return Err(SettingsError::ReadOnly(why));
         }
+        if let Some(found) = newer_on_disk(&self.path, SETTINGS_SCHEMA) {
+            return Err(SettingsError::ReadOnly(self.mark_read_only(found)));
+        }
+        Ok(())
     }
 
     pub fn get(&self) -> Settings {
@@ -242,6 +258,12 @@ impl SettingsStore {
         let mut next = self.get();
         mutate(&mut next);
         validate(&next)?;
+        // Check again under the lock a newer version would migrate under, then write.
+        let dir = self.path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let _lock = MigrateLock::acquire(&dir).ok();
+        if let Some(found) = newer_on_disk(&self.path, SETTINGS_SCHEMA) {
+            return Err(SettingsError::ReadOnly(self.mark_read_only(found)));
+        }
         persist(&self.path, &next)?;
         self.tx.send_replace(next.clone());
         Ok(next)
@@ -359,6 +381,23 @@ mod tests {
         let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(on_disk[SCHEMA_KEY], SETTINGS_SCHEMA);
         assert_eq!(on_disk["server"]["port"], 5000);
+    }
+
+    /// A newer version may migrate the file after this process loaded it (a package
+    /// upgrade while this copy runs in the tray): the next write must notice, not clobber.
+    #[test]
+    fn a_file_a_newer_version_migrated_after_load_is_never_overwritten() {
+        let d = dir();
+        let p = d.join("settings.json");
+        let store = SettingsStore::at(p.clone());
+        assert_eq!(store.status(), FileStatus::Ok);
+        let newer = r#"{"schemaVersion":9,"server":{"port":4999}}"#;
+        std::fs::write(&p, newer).unwrap();
+
+        assert!(matches!(store.update(|s| s.server.port = 1), Err(SettingsError::ReadOnly(_))));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), newer, "byte-identical");
+        assert_eq!(store.status(), FileStatus::ReadOnlyNewer);
+        assert!(matches!(store.ensure_writable(), Err(SettingsError::ReadOnly(_))));
     }
 
     /// The API body has no schema key, before or after.

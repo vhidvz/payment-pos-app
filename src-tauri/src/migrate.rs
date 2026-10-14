@@ -217,6 +217,24 @@ pub fn backup_path(path: &Path, from: u32) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The schema the file on disk declares right now, when it is newer than `supported` —
+/// the write-time half of "never write over a newer file": a newer version may have
+/// migrated the file after this process loaded it (a package upgrade while this copy
+/// keeps running). Call it under the migrate lock, just before writing.
+pub fn newer_on_disk(path: &Path, supported: u32) -> Option<u32> {
+    let raw = std::fs::read(path).ok()?;
+    let doc: Value = serde_json::from_slice(&raw).ok()?;
+    schema_of(&doc).ok().filter(|found| *found > supported)
+}
+
+pub fn newer_message(path: &Path, found: u32, supported: u32) -> String {
+    format!(
+        "{} was written by a newer Ledger POS (schema {found}; this version understands {supported}) \
+         — open that version, or restore a .bak backup beside it",
+        path.display()
+    )
+}
+
 /// Persist a migrated document: back the original up once, then replace it.
 pub fn commit_upgrade(path: &Path, from: u32, migrated: &[u8]) -> std::io::Result<PathBuf> {
     let backup = backup_path(path, from);

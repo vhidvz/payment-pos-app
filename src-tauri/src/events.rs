@@ -244,8 +244,9 @@ pub fn envelope(
 pub struct EventBus {
     outbox_path: Option<PathBuf>,
     /// False when the file belongs to a newer version: it is never written (spec §2.3).
-    outbox_writable: bool,
-    outbox_status: crate::migrate::FileStatus,
+    /// Set at load, or by a persist that finds a newer version migrated the file since.
+    outbox_writable: std::sync::atomic::AtomicBool,
+    outbox_status: Mutex<crate::migrate::FileStatus>,
     migrations: Vec<crate::migrate::MigrationRecord>,
     outbox: Mutex<Vec<Delivery>>,
     /// Every subscription seen during this process's life, by id. A message queued
@@ -363,8 +364,8 @@ impl EventBus {
         };
         Self {
             outbox_path,
-            outbox_writable,
-            outbox_status,
+            outbox_writable: std::sync::atomic::AtomicBool::new(outbox_writable),
+            outbox_status: Mutex::new(outbox_status),
             migrations,
             outbox: Mutex::new(outbox),
             known: Mutex::new(HashMap::new()),
@@ -375,7 +376,7 @@ impl EventBus {
     }
 
     pub fn outbox_status(&self) -> crate::migrate::FileStatus {
-        self.outbox_status
+        *self.outbox_status.lock().expect("outbox status")
     }
 
     /// The migrations loading the outbox performed.
@@ -493,10 +494,22 @@ impl EventBus {
         let Some(path) = &self.outbox_path else {
             return;
         };
-        if !self.outbox_writable {
+        if !self.outbox_writable.load(std::sync::atomic::Ordering::SeqCst) {
             return; // a newer version's outbox: never written (spec §2.3)
         }
         let _guard = self.persist_lock.lock().expect("persist lock");
+        // A newer version may have migrated the file since this process loaded it.
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let _lock = crate::migrate::MigrateLock::acquire(dir).ok();
+        if let Some(found) = crate::migrate::newer_on_disk(path, OUTBOX_SCHEMA) {
+            tracing::warn!(
+                "{}; this run's events are kept in memory only",
+                crate::migrate::newer_message(path, found, OUTBOX_SCHEMA)
+            );
+            self.outbox_writable.store(false, std::sync::atomic::Ordering::SeqCst);
+            *self.outbox_status.lock().expect("outbox status") = crate::migrate::FileStatus::ReadOnlyNewer;
+            return;
+        }
         // Snapshot inside the guard: the last writer always writes the newest state.
         let snapshot = self.outbox.lock().expect("outbox").clone();
         let meta = std::fs::metadata(path).ok();
@@ -1059,6 +1072,21 @@ mod tests {
         bus.outbox.lock().unwrap().push(delivery(9));
         bus.persist();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), newer, "byte-identical");
+    }
+
+    /// Loaded writable, then a newer version migrates the file underneath: the next
+    /// persist must leave it alone and keep this run's events in memory.
+    #[test]
+    fn an_outbox_a_newer_version_migrated_after_load_is_never_overwritten() {
+        let d = outbox_dir();
+        let p = d.join("events-outbox.json");
+        let bus = EventBus::new(Some(p.clone()));
+        let newer = r#"{"schemaVersion":7,"deliveries":[]}"#;
+        std::fs::write(&p, newer).unwrap();
+        bus.outbox.lock().unwrap().push(delivery(1));
+        bus.persist();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), newer, "byte-identical");
+        assert_eq!(bus.outbox_status(), crate::migrate::FileStatus::ReadOnlyNewer);
     }
 
     #[test]
