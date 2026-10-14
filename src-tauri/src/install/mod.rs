@@ -142,6 +142,8 @@ pub enum UnknownReason {
     BadVersionKey(String),
     /// An interrupted install that recovery could not finish.
     UnreconciledJournal,
+    /// The menu entry exists but cannot be read.
+    UnreadableEntry(String),
 }
 
 impl std::fmt::Display for UnknownReason {
@@ -149,6 +151,7 @@ impl std::fmt::Display for UnknownReason {
         match self {
             Self::BadVersionKey(v) => write!(f, "the menu entry names version \"{v}\""),
             Self::UnreconciledJournal => write!(f, "an earlier install was interrupted and could not be finished"),
+            Self::UnreadableEntry(e) => write!(f, "the menu entry cannot be read ({e})"),
         }
     }
 }
@@ -171,9 +174,16 @@ pub fn installed(layout: &Layout) -> Installed {
     if !is_installed(layout) {
         return Installed::None;
     }
-    let entry = std::fs::read_to_string(layout.desktop_path()).unwrap_or_default();
-    let prefix = format!("{VERSION_KEY}=");
-    match entry.lines().find_map(|l| l.strip_prefix(prefix.as_str())) {
+    // An entry that cannot be read says nothing about the version — never `Legacy`.
+    let entry = match std::fs::read_to_string(layout.desktop_path()) {
+        Ok(entry) => entry,
+        Err(e) => return Installed::Unknown(UnknownReason::UnreadableEntry(e.to_string())),
+    };
+    // The Desktop Entry spec allows spaces around `=`.
+    let value = entry
+        .lines()
+        .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == VERSION_KEY).map(|(_, v)| v));
+    match value {
         None => Installed::Legacy,
         Some(raw) => match semver::Version::parse(raw.trim()) {
             Ok(v) => Installed::Version(v),
@@ -456,6 +466,25 @@ mod tests {
         let (_, _, layout) = fake_appimage();
         entry_with(&layout, "X-LedgerPOS-Version= 1.0.0 \r\n");
         assert_eq!(installed(&layout), Installed::Version(semver::Version::new(1, 0, 0)));
+    }
+
+    /// The Desktop Entry spec allows spaces around `=`.
+    #[test]
+    fn version_key_tolerates_spaces_around_the_equals_sign() {
+        let (_, _, layout) = fake_appimage();
+        entry_with(&layout, "X-LedgerPOS-Version = 1.0.0\n");
+        assert_eq!(installed(&layout), Installed::Version(semver::Version::new(1, 0, 0)));
+    }
+
+    /// An entry that cannot be read says nothing about the version: never `Legacy`, which
+    /// would let an older file "update" over what may be a newer install.
+    #[test]
+    fn an_unreadable_desktop_entry_is_unknown_not_legacy() {
+        let (_, _, layout) = fake_appimage();
+        std::fs::create_dir_all(layout.app_path().parent().unwrap()).unwrap();
+        std::fs::write(layout.app_path(), b"#app").unwrap();
+        std::fs::create_dir_all(layout.desktop_path()).unwrap(); // a directory: read fails
+        assert!(matches!(installed(&layout), Installed::Unknown(UnknownReason::UnreadableEntry(_))));
     }
 
     #[test]

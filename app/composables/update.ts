@@ -8,7 +8,7 @@ export interface BootInfo {
   mode: BootMode
   current: string
   installed?: string
-  reason?: 'badVersionKey' | 'unreconciledJournal'
+  reason?: 'badVersionKey' | 'unreconciledJournal' | 'unreadableEntry'
   detail?: string
   running: boolean
 }

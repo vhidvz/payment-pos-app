@@ -76,6 +76,7 @@ impl BootInfo {
                 reason: Some(match reason {
                     UnknownReason::BadVersionKey(_) => "badVersionKey",
                     UnknownReason::UnreconciledJournal => "unreconciledJournal",
+                    UnknownReason::UnreadableEntry(_) => "unreadableEntry",
                 }),
                 detail: Some(reason.to_string()),
                 ..base("replaceUnknown")
