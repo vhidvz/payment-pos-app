@@ -328,6 +328,13 @@ fn commit(layout: &Layout, j: &Journal, opts: &Options) -> Result<Report, TxnErr
 fn run_locked(layout: &Layout, planned: &[Planned], to: &str, opts: &Options) -> Result<Report, TxnError> {
     debug_assert_eq!(planned.last().map(|p| &p.target), Some(&layout.desktop_path()), "desktop entry last");
     let from = super::installed_label(&super::installed(layout));
+    // Reinstalling the version that is installed (a repair, `--update` twice, the update
+    // screen opened twice) must not rotate the rollback generation onto a copy of itself.
+    let mut opts = opts.clone();
+    if from == to {
+        opts.skip_snapshot = true;
+    }
+    let opts = &opts;
     let txid = uuid::Uuid::new_v4().simple().to_string();
     let gen = format!("gen-{txid}");
     std::fs::create_dir_all(&layout.state).map_err(io)?;
@@ -630,6 +637,22 @@ mod tests {
         std::fs::write(&victim, b"bitrot").unwrap();
         assert!(matches!(rollback(&l, &Options::default()), Err(TxnError::SourceDamaged(_))));
         assert_set(&l, "1.1.0");
+    }
+
+    /// A repair run of the same file, `--update` twice, the update screen opened twice: the
+    /// rollback generation must stay the real previous version, not a copy of the current.
+    #[test]
+    fn reinstalling_the_same_version_keeps_the_real_previous_version() {
+        let r = root();
+        let l = layout(&r);
+        put(&l, &r, "1.0.0", None).unwrap();
+        put(&l, &r, "1.1.0", None).unwrap();
+        put(&l, &r, "1.1.0", None).unwrap();
+        assert_eq!(prev_version(&l).as_deref(), Some("1.0.0"));
+        let (_, v) = rollback(&l, &Options::default()).unwrap();
+        assert_eq!(v, "1.0.0");
+        assert_set(&l, "1.0.0");
+        assert_clean(&l);
     }
 
     #[test]
