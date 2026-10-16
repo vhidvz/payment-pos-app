@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-16
+
 ### Added
 
 - Security screen: set the lock and auto-lock, manage webhooks, turn receipts on — via the system's admin prompt. @vhidvz
@@ -26,5 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - initial release 🎉​🎊​.
 
-[unreleased]: https://github.com/vhidvz/payment-pos-app/compare/1.0.0...HEAD
-[1.0.0]: https://github.com/vhidvz/payment-pos-app/releases/tag/1.0.0
+[unreleased]: https://github.com/vhidvz/payment-pos-app/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/vhidvz/payment-pos-app/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/vhidvz/payment-pos-app/releases/tag/v1.0.0
