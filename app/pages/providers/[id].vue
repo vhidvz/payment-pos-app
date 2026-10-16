@@ -53,6 +53,11 @@
           <div class="font-medium">{{ link.detail }}</div>
           <p v-if="link.hint" class="mt-1 leading-relaxed opacity-90">{{ link.hint }}</p>
         </div>
+        <p v-if="detail.metadata.id === 'saman-ssp1126'" class="mt-4 text-xs leading-relaxed text-paper-mute">
+          <strong class="text-paper-dim">After every power-on, insert a card in the terminal once — you can cancel it.</strong>
+          The terminal only opens its link to this computer the first time a card wakes it; until then it refuses every
+          connection. <NuxtLink to="/guide#terminal" class="text-brass-400 hover:text-brass-300">More on connecting</NuxtLink>
+        </p>
         <a
           v-if="detail.metadata.docsUrl"
           :href="detail.metadata.docsUrl"

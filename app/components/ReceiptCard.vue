@@ -100,6 +100,29 @@
         </div>
       </dl>
 
+      <!-- signed receipt -->
+      <div v-if="signed" class="rounded-xl border px-4 py-3" :class="postureMoved ? 'border-warn/30 bg-warn/5' : 'border-ok/25 bg-ok/5'">
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div class="flex items-center gap-2 text-sm font-medium" :class="postureMoved ? 'text-warn' : 'text-ok'">
+            <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /><path d="m9 12 2 2 4-4" /></svg>
+            Signed receipt
+          </div>
+          <button type="button" class="text-xs text-brass-400 hover:text-brass-300" @click="copyText(String(result.attestation))">Copy token</button>
+        </div>
+        <dl class="grid grid-cols-2 gap-x-6 gap-y-2 text-xs sm:grid-cols-4">
+          <div><dt class="data-label mb-0.5">Key id</dt><dd class="font-mono text-paper-dim">{{ signed.header.kid ?? '—' }}</dd></div>
+          <div><dt class="data-label mb-0.5">Signed at</dt><dd class="text-paper-dim tabular">{{ signedAt }}</dd></div>
+          <div class="col-span-2"><dt class="data-label mb-0.5">Receipt id (jti)</dt><dd class="font-mono break-all text-paper-dim">{{ signed.claims.jti }}</dd></div>
+        </dl>
+        <p class="mt-2 text-[0.6875rem] leading-relaxed" :class="postureMoved ? 'text-warn' : 'text-paper-mute'">
+          {{
+            postureMoved
+              ? 'The machine\'s setup changed while this operation ran (postureChanged: true) — a careful receiver will not trust it.'
+              : 'The receiver verifies this token with the receipt key and should store its id against the order, so one receipt pays for one sale.'
+          }}
+        </p>
+      </div>
+
       <!-- raw -->
       <details class="group">
         <summary class="cursor-pointer text-xs text-paper-mute transition-colors select-none hover:text-paper-dim">
@@ -138,6 +161,14 @@ const verdict = computed<'ok' | 'fail' | 'info'>(() => {
 })
 
 const meta = computed(() => `${props.provider} · ${props.fnId}`)
+
+/** The `attestation` an administrator's receipt key adds — read for display, not verified. */
+const signed = computed(() => decodeJws(props.result?.attestation))
+const postureMoved = computed(() => signed.value?.claims.postureChanged === true)
+const signedAt = computed(() => {
+  const iat = Number(signed.value?.claims.iat)
+  return Number.isFinite(iat) ? new Date(iat * 1000).toLocaleTimeString() : '—'
+})
 
 const amount = computed(() => {
   const a = (txn.value.amount ?? txn.value.effectiveAmount ?? props.result?.amountRials) as

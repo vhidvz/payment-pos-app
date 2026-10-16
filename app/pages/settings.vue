@@ -1,7 +1,7 @@
 <template>
   <div ref="root">
     <PageHeader
-      kicker="Settings · 04"
+      kicker="Settings · 05"
       title="Tuned to your desk."
       lede="Everything here is stored in a plain JSON file you also own — edit it from this screen, over the REST API, or in a text editor."
     >
@@ -78,6 +78,10 @@
             <TSwitch v-model="model.app.startMinimized" label="Start minimized" />
           </div>
         </div>
+        <p class="mt-5 text-[0.6875rem] leading-relaxed text-paper-mute">
+          No desktop at all, or a server? The same API runs without a window as <code class="font-mono">posd</code> —
+          <NuxtLink to="/guide#background" class="text-brass-400 hover:text-brass-300">how to run it as a service</NuxtLink>.
+        </p>
       </GlassCard>
 
       <!-- appearance -->
@@ -133,44 +137,47 @@
           </button>
         </div>
 
+        <div v-if="installInfo.installed && installInfo.previousVersion" class="mt-4 flex flex-wrap items-center justify-between gap-4 border-t hairline pt-4">
+          <div>
+            <div class="data-label mb-1">Previous version</div>
+            <div class="font-mono text-xs text-paper-dim">{{ installInfo.previousVersion }} — kept for one rollback</div>
+          </div>
+          <button type="button" class="btn-ghost" :disabled="installBusy" @click="rollBack">Roll back</button>
+        </div>
+
         <p class="mt-4 text-[0.6875rem] leading-relaxed text-paper-mute">
           Removing takes back only what was installed. Your settings stay where they are.
+          <strong class="text-paper-dim">To update</strong>, download the newer AppImage and open it: it offers
+          <em>Update and restart</em>, finishing any sale in progress first.
         </p>
       </GlassCard>
 
-      <!-- security -->
+      <!-- security pointer -->
       <GlassCard data-reveal>
-        <h2 class="display mb-1 text-xl text-paper">Application lock</h2>
-        <p class="mb-5 text-xs leading-relaxed text-paper-mute">
-          Set by the machine administrator, not from here — the password lives in a root-owned file
-          so it cannot be removed with a text editor.
-        </p>
-
-        <dl class="mb-5 grid grid-cols-2 gap-4">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 class="display mb-1 text-xl text-paper">Lock, webhooks and signed receipts</h2>
+            <p class="max-w-[60ch] text-xs leading-relaxed text-paper-mute">
+              Set by the computer's administrator and kept outside this file, so they cannot be switched off with a text
+              editor. Manage them on the Security screen.
+            </p>
+          </div>
+          <NuxtLink to="/security" class="btn-ghost shrink-0 text-xs">Open Security →</NuxtLink>
+        </div>
+        <dl class="mt-4 grid grid-cols-3 gap-4">
           <div>
             <dt class="data-label mb-1">Password</dt>
             <dd class="text-sm text-paper-dim">{{ auth.status.value.passwordSet ? 'Set' : 'Not set' }}</dd>
           </div>
           <div>
-            <dt class="data-label mb-1">Auto-lock</dt>
-            <dd class="text-sm text-paper-dim">
-              {{ auth.status.value.autoLockMinutes > 0 ? `${auth.status.value.autoLockMinutes} min idle` : 'Disabled' }}
-            </dd>
+            <dt class="data-label mb-1">Webhooks</dt>
+            <dd class="text-sm text-paper-dim">{{ events ? events.subscriptions.filter((x) => x.enabled).length : '—' }}</dd>
+          </div>
+          <div>
+            <dt class="data-label mb-1">Signed receipts</dt>
+            <dd class="text-sm text-paper-dim">{{ events ? (events.receiptKeyId ? 'On' : 'Off') : '—' }}</dd>
           </div>
         </dl>
-
-        <div class="glass-inset space-y-1 px-4 py-3 font-mono text-[0.6875rem] text-paper-mute">
-          <div>sudo posd admin set-password</div>
-          <div>sudo posd admin clear-password</div>
-          <div>sudo posd admin auto-lock 15</div>
-          <div>sudo posd admin status</div>
-          <div class="pt-2 text-paper-dim">AppImage install? prefix with the full path:</div>
-          <div>sudo ~/.local/bin/posd admin status</div>
-        </div>
-
-        <p class="mt-4 text-[0.6875rem] leading-relaxed text-paper-mute">
-          While locked, this screen, provider configuration and the Operations runner are read-only.
-        </p>
       </GlassCard>
 
       <!-- about -->
@@ -182,13 +189,30 @@
             <dt class="data-label mb-1">Version</dt>
             <dd class="font-mono text-paper">{{ system?.version ?? '—' }}</dd>
           </div>
-          <div v-for="(label, key) in DATA_FILES" :key="key">
+          <div v-for="(label, key) in DATA_FILES" :key="key" :title="DATA_HELP[key]">
             <dt class="data-label mb-1">{{ label }}</dt>
             <dd :class="system?.data[key] === 'ok' ? 'text-paper-dim' : 'text-warn'">
               {{ system ? STATUS_TEXT[system.data[key]] : '—' }}
             </dd>
           </div>
         </dl>
+        <details class="mt-4">
+          <summary class="disclosure">What these files are, and what the states mean</summary>
+          <dl class="mt-3 grid gap-x-6 gap-y-2 text-xs leading-relaxed text-paper-dim sm:grid-cols-[auto_1fr]">
+            <template v-for="(label, key) in DATA_FILES" :key="key">
+              <dt class="text-paper">{{ label }}</dt>
+              <dd>{{ DATA_HELP[key] }}</dd>
+            </template>
+            <dt class="text-paper">up to date</dt>
+            <dd>Read normally. After an update each file is brought up to date once and the original kept beside it as <code class="font-mono">&lt;file&gt;.v&lt;N&gt;.bak</code>.</dd>
+            <dt class="text-paper">newer — read-only</dt>
+            <dd>Written by a newer version. This version reads it but never overwrites it, so going back a version loses nothing; settings cannot be saved until you update again.</dd>
+            <dt class="text-paper">newer — locked</dt>
+            <dd>The administrator file is from a newer version: the console stays locked rather than guess.</dd>
+            <dt class="text-paper">recovered</dt>
+            <dd>The file could not be read; it was set aside as <code class="font-mono">.invalid</code> and defaults used.</dd>
+          </dl>
+        </details>
       </GlassCard>
 
       <!-- file location -->
@@ -215,13 +239,27 @@
 </template>
 
 <script setup lang="ts">
-import type { FileStatus, ProviderSummary, Settings, SystemInfo } from '~/composables/api'
+import type { EventsStatus, FileStatus, ProviderSummary, Settings, SystemInfo } from '~/composables/api'
 
 const api = useApi()
 const auth = useAuth()
 const locked = useLocked()
-const { info: installInfo, install: installApp, uninstall: uninstallApp, refresh: refreshInstall } = useInstall()
+const { info: installInfo, install: installApp, uninstall: uninstallApp, rollback: rollbackApp, refresh: refreshInstall } = useInstall()
 const installBusy = ref(false)
+const events = ref<EventsStatus | null>(null)
+
+async function rollBack() {
+  if (!confirm(`Put version ${installInfo.value.previousVersion} back on the applications menu? It runs from the next start; your data files are not changed.`)) return
+  installBusy.value = true
+  try {
+    const v = await rollbackApp()
+    toast('ok', `Rolled back to ${v}. Quit Ledger POS and open it again to run it.`)
+  } catch (e) {
+    toast('error', e instanceof Error ? e.message : String(e))
+  } finally {
+    installBusy.value = false
+  }
+}
 
 async function addApp() {
   installBusy.value = true
@@ -255,6 +293,12 @@ const settingsFile = ref('')
 const system = ref<SystemInfo | null>(null)
 
 const DATA_FILES = { settings: 'Settings', admin: 'Administrator file', outbox: 'Webhook outbox', state: 'Run state' } as const
+const DATA_HELP: Record<keyof typeof DATA_FILES, string> = {
+  settings: 'settings.json — everything on this screen and each terminal\'s configuration. Yours to edit, here, over the API or by hand.',
+  admin: 'admin.json — the password hash, auto-lock, webhooks and the receipt key. Only the computer\'s administrator writes it.',
+  outbox: 'events-outbox.json — webhook messages not delivered yet, retried for 72 hours.',
+  state: 'state.json — the last version that ran, so an update can say what changed.',
+}
 const STATUS_TEXT: Record<FileStatus, string> = {
   ok: 'up to date',
   readOnlyNewer: 'newer — read-only',
@@ -283,6 +327,7 @@ const corsText = computed({
 
 async function load() {
   try {
+    api.events().then((e) => (events.value = e)).catch(() => {})
     const [s, p, sys] = await Promise.all([api.settings(), api.providers(), api.system()])
     model.value = s
     providerList.value = p

@@ -4,7 +4,11 @@
       kicker="Operations · 03"
       title="Run the terminal."
       lede="Pick a provider and a function; the form below is generated from its live parameter spec — the same contract the REST API publishes."
-    />
+    >
+      <template #actions>
+        <NuxtLink to="/guide#api" class="btn-ghost">Call it from your till</NuxtLink>
+      </template>
+    </PageHeader>
 
     <LockBanner what="Manual terminal operations" />
 
@@ -46,6 +50,15 @@
             <span class="rounded-full border hairline px-2.5 py-0.5 text-[0.625rem] tracking-wide text-paper-mute uppercase">{{ selectedFn.category }}</span>
           </div>
           <p class="mb-5 max-w-[64ch] text-sm leading-relaxed text-paper-dim">{{ selectedFn.description }}</p>
+
+          <p
+            v-if="receiptKeyId && selectedSummary"
+            class="mb-4 rounded-lg border px-3 py-2 text-xs leading-relaxed"
+            :class="selectedSummary.active ? 'border-ok/25 bg-ok/5 text-paper-dim' : 'border-line-bright bg-white/2 text-paper-mute'"
+          >
+            <template v-if="selectedSummary.active">Signed receipts are on: a successful result here carries a signed <code class="font-mono">attestation</code>.</template>
+            <template v-else>Not signed — receipts are only signed for the active terminal, never for {{ selectedSummary.name }}.</template>
+          </p>
 
           <FnForm :fn="selectedFn" :busy="busy || locked" @invoke="run" />
 
@@ -96,6 +109,8 @@ const lastDuration = ref<number>()
 const lastFnId = ref('')
 
 const selectedFn = computed(() => functions.value.find((f) => f.id === selectedFnId.value) ?? null)
+const selectedSummary = computed(() => providers.value.find((p) => p.id === selectedProvider.value) ?? null)
+const receiptKeyId = ref<string | null>(null)
 
 const CATEGORY_ORDER = ['transaction', 'inquiry', 'report', 'diagnostics', 'session', 'utility']
 const grouped = computed(() => {
@@ -171,6 +186,7 @@ async function run(params: Record<string, unknown>) {
 }
 
 onMounted(async () => {
+  api.events().then((e) => (receiptKeyId.value = e.receiptKeyId)).catch(() => {})
   try {
     await loadProviders()
     await loadFunctions()

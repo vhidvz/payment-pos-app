@@ -183,6 +183,12 @@ pub fn prev_gen(layout: &Layout) -> Option<String> {
     serde_json::from_slice::<PrevPointer>(&raw).ok().map(|p| p.gen)
 }
 
+/// The version [`rollback`] would bring back, if one is kept.
+pub fn previous_version(layout: &Layout) -> Option<String> {
+    let gen = prev_gen(layout)?;
+    read_manifest(&layout.generations_dir().join(gen)).map(|m| m.version)
+}
+
 fn write_pointer(layout: &Layout, gen: &str) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&PrevPointer { gen: gen.into() }).expect("pointer");
     atomic_write(&layout.prev_pointer(), &bytes, None, 0o644)
@@ -600,6 +606,20 @@ mod tests {
         std::fs::write(l.app_path(), b"tampered").unwrap();
         assert!(matches!(recover(&l), Err(RecoverError::Inconsistent(_))));
         assert_eq!(std::fs::read(l.app_path()).unwrap(), b"tampered", "recovery touched nothing");
+    }
+
+    /// The console offers "Roll back to …" only when there is something to roll back to,
+    /// and names it — from the same record `rollback` restores.
+    #[test]
+    fn previous_version_names_the_kept_generation() {
+        let r = root();
+        let l = layout(&r);
+        assert_eq!(previous_version(&l), None);
+        put(&l, &r, "1.0.0", None).unwrap();
+        put(&l, &r, "1.1.0", None).unwrap();
+        assert_eq!(previous_version(&l).as_deref(), Some("1.0.0"));
+        rollback(&l, &Options::default()).unwrap();
+        assert_eq!(previous_version(&l).as_deref(), Some("1.1.0"));
     }
 
     #[test]

@@ -4,7 +4,11 @@
       kicker="Providers · 02"
       title="Interchangeable engines."
       lede="Each provider drives a family of terminals behind the same self-describing interface. Select one as active, configure it, and every function becomes available over REST."
-    />
+    >
+      <template #actions>
+        <NuxtLink to="/guide#terminal" class="btn-ghost">Connecting a terminal</NuxtLink>
+      </template>
+    </PageHeader>
 
     <div class="grid gap-5 lg:grid-cols-2">
       <GlassCard v-for="p in providers" :key="p.id" data-reveal class="hover-glow flex flex-col">
@@ -35,8 +39,8 @@
             {{ p.functionCount }} functions · {{ p.transports.join(' / ') }}
           </span>
           <div class="flex gap-2">
-            <button v-if="!p.active" class="btn-ghost !py-1.5 text-xs" type="button" @click="activate(p.id)">
-              Make active
+            <button v-if="!p.active" class="btn-ghost !py-1.5 text-xs" type="button" @click="locked ? requestUnlock() : activate(p.id)">
+              {{ locked ? 'Unlock to activate' : 'Make active' }}
             </button>
             <NuxtLink :to="`/providers/${p.id}`" class="btn-primary !py-1.5 text-xs">Open</NuxtLink>
           </div>
@@ -50,6 +54,7 @@
 import type { ProviderSummary } from '~/composables/api'
 
 const api = useApi()
+const locked = useLocked()
 const root = ref<HTMLElement>()
 useReveal(root)
 

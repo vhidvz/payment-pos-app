@@ -10,6 +10,10 @@ operations so you can build your integration without hardware.
 
 ![The Ledger POS console](screenshot.png)
 
+Everything below is also in the app itself: **Guide** in the sidebar explains every feature with
+this machine's real addresses, and the **Overview** keeps a getting-started checklist that ticks
+itself as you go.
+
 ## Install
 
 **Download** the file for your system from the
@@ -51,7 +55,12 @@ pnpm tauri build
 ```
 
 The first build compiles Rust from scratch — give it a few minutes. Installers
-land in `src-tauri/target/release/bundle/`.
+land in `src-tauri/target/release/bundle/`. `node scripts/check-appimage.mjs` checks that an
+AppImage carries no library that must come from the host (today: `libwayland`); the release
+workflow runs it on every build.
+
+`pnpm dev` serves the console in a browser against the API on port 4373; set
+`VITE_LEDGER_API=http://127.0.0.1:<port>` to point it at a `posd` started elsewhere.
 
 ### 3. Install and start
 
@@ -165,7 +174,7 @@ curl -X POST localhost:4373/api/v1/providers/saman-ssp1126/functions/purchase/in
 | POST | `/api/v1/providers/active/functions/{fn}/invoke` | Run it on the active terminal |
 | GET | `/api/v1/auth/status` | Is a password set, are you locked |
 | POST | `/api/v1/auth/unlock` · `/lock` | Get / give up a token |
-| GET | `/api/v1/events` | Webhooks, receipt signing, delivery state (no secrets) |
+| GET | `/api/v1/events` | Webhooks, receipt signing, delivery state, event types, admin-file permissions (no secrets) |
 
 **Use generous timeouts** — card operations block until the cardholder acts, up
 to about two minutes. Only one transaction runs per terminal at a time.
@@ -198,6 +207,17 @@ API, same port, so run one or the other.
 Optional and off by default. Only someone with `sudo` can set or remove the
 password; anyone who knows it can unlock the console; everyone else can look but
 not change anything.
+
+**In the app:** *Security → Application lock* sets, changes or removes the password and the
+auto-lock time. Your system asks for the administrator's password (the one for `sudo`) in its
+own dialog — the console runs exactly the commands below through the system's `pkexec`. It only
+hands the administrator a `posd` that root alone can change, of the console's own version: a
+package install's `/usr/bin/posd` qualifies; after an AppImage install, make the root-owned copy
+once — `sudo install -o root -g root -m 755 ~/.local/bin/posd /usr/local/bin/posd` (again after
+each update; the console says when). Otherwise anyone sharing the desktop account could swap
+`~/.local/bin/posd` and have the administrator's password run it — which is also why `sudo
+~/.local/bin/posd …` below deserves the same care. Where it cannot ask (Windows, no polkit agent,
+no trusted copy), it shows the command to run instead. From a terminal:
 
 ```sh
 sudo posd admin set-password      # asks twice, shows nothing as you type
@@ -237,7 +257,9 @@ file.
 ## Events and signed receipts
 
 Both optional, both off until an administrator turns them on, and neither
-changes anything an existing integration reads.
+changes anything an existing integration reads. *Security* in the app adds, tests, pauses
+and removes webhooks, shows recent deliveries, and turns receipts on, rotates or clears the
+key — each secret shown once — through the same administrator prompt as the lock.
 
 **Webhook events** tell a server somewhere else when this machine changes in a
 way that matters to it — the lock opened, the password removed, the terminal
@@ -246,8 +268,13 @@ repointed, browser access widened:
 ```sh
 sudo posd admin events add https://example.com/hooks/pos            # every event
 sudo posd admin events add https://… --events security.*,settings.changed
-sudo posd admin events list | remove <id> | test [<id>]
+sudo posd admin events list | remove <id> | enable <id> | disable <id> | test [<id>]
 ```
+
+`disable` pauses a subscription without losing its secret; like `add` and `remove` it is
+announced to the endpoints. Every `posd admin` command also takes `--json` right after `admin`
+for a machine-readable answer, and `set-password --stdin` reads the password from stdin — the
+console uses both.
 
 `add` prints the signing secret once. Messages follow
 [Standard Webhooks](https://www.standardwebhooks.com) — `webhook-id`,
@@ -313,7 +340,8 @@ because the posture travels with every sale.
 | `409 busy` | One transaction at a time — wait for the previous one. |
 | A transaction occasionally takes ~20s | The terminal sometimes ignores the opening message; the app re-sends it automatically. Raise **firstAckAttempts** on the provider page if it still gives up. |
 | API did not start | Port taken, or the app and `posd` are both running. See `/api/v1/system`. |
-| Forgot the password | `sudo posd admin clear-password` on the machine. |
+| Forgot the password | *Security → Remove password*, or `sudo posd admin clear-password` on the machine. |
+| Blank window right after start (Linux AppImage 1.0.0) | That AppImage bundled an old `libwayland` that stops a newer Mesa from loading its EGL (`Could not create default EGL display: EGL_BAD_PARAMETER`). Use a newer AppImage — builds now take it from the host. |
 
 ## Security notes
 

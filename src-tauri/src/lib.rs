@@ -8,6 +8,7 @@
 pub mod activity;
 pub mod admission;
 pub mod cli;
+pub mod elevate;
 pub mod events;
 pub mod fsutil;
 pub mod install;
@@ -92,6 +93,9 @@ struct InstallInfo {
     installed_path: Option<String>,
     /// The offer has already been answered once.
     prompt_dismissed: bool,
+    /// The version kept for one rollback, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_version: Option<String>,
 }
 
 fn install_info(state: &AppState) -> InstallInfo {
@@ -102,6 +106,7 @@ fn install_info(state: &AppState) -> InstallInfo {
         installed_path: install::is_installed(&layout)
             .then(|| layout.app_path().display().to_string()),
         prompt_dismissed: state.settings.get().app.install_prompt_dismissed,
+        previous_version: install::txn::previous_version(&layout),
     }
 }
 
@@ -131,6 +136,38 @@ fn uninstall_app(state: tauri::State<'_, AppState>) -> Result<InstallInfo, Strin
     let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
     install::uninstall(&install::Layout::current())?;
     Ok(install_info(&state))
+}
+
+/// `--rollback` from the console: the previous version goes back on the menu and runs from
+/// the next start. Refused while `posd` runs, like the command — it may be that version.
+#[tauri::command]
+fn rollback_install(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    use update::system::System;
+    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
+    let pids = update::system::RealSystem::new().posd_pids();
+    if !pids.is_empty() {
+        return Err(update::engine::posd_message(&pids));
+    }
+    install::rollback(&install::Layout::current())
+}
+
+// ------------------------------------------------------- administrator actions
+
+/// Whether the console can ask the OS for the administrator here, and the terminal form.
+#[tauri::command]
+fn admin_preview(op: elevate::AdminOp) -> elevate::AdminPreview {
+    elevate::preview(&op)
+}
+
+/// Run one administrator action through the OS's own password dialog ([`elevate`]).
+#[tauri::command]
+async fn admin_run(op: elevate::AdminOp) -> elevate::AdminRunResult {
+    tauri::async_runtime::spawn_blocking(move || elevate::run(&op))
+        .await
+        .unwrap_or_else(|e| elevate::AdminRunResult::Failed {
+            message: e.to_string(),
+            command: String::new(),
+        })
 }
 
 /// Remember that the offer was declined, so it is made once and not again.
@@ -519,6 +556,9 @@ fn run_normal(background: bool) {
             install_app,
             uninstall_app,
             dismiss_install_prompt,
+            rollback_install,
+            admin_preview,
+            admin_run,
             boot_mode,
             version_notice,
             ack_version_notice

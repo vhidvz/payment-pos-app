@@ -6,9 +6,14 @@
       lede="Every capability of your payment terminals, served as a local REST API — always on, fully documented, provider-agnostic."
     >
       <template #actions>
-        <button class="btn-ghost" type="button" @click="openApiDocs()">Open Swagger docs</button>
+        <div class="flex gap-2">
+          <NuxtLink to="/guide" class="btn-ghost">Guide</NuxtLink>
+          <button class="btn-ghost" type="button" @click="openApiDocs()">Open Swagger docs</button>
+        </div>
       </template>
     </PageHeader>
+
+    <GettingStarted :providers="providers" :activity="allActivity" />
 
     <!-- status band -->
     <div class="mb-6 grid gap-4 md:grid-cols-3">
@@ -109,6 +114,8 @@ useReveal(root)
 const sys = ref<SystemInfo | null>(null)
 const providers = ref<ProviderSummary[]>([])
 const entries = ref<ActivityEntry[]>([])
+/** A longer window than the list shows, so the checklist can see past the latest calls. */
+const allActivity = ref<ActivityEntry[]>([])
 const testing = ref(false)
 const testResult = ref<Record<string, unknown> | null>(null)
 const testDuration = ref<number>()
@@ -125,10 +132,11 @@ const upSecs = ref(0)
 
 async function refresh() {
   try {
-    const [s, p, a] = await Promise.all([api.system(), api.providers(), api.activity(8)])
+    const [s, p, a] = await Promise.all([api.system(), api.providers(), api.activity(200)])
     sys.value = s
     providers.value = p
-    entries.value = a
+    allActivity.value = a
+    entries.value = a.slice(0, 8)
   } catch {
     /* layout badge already reflects unreachability */
   }

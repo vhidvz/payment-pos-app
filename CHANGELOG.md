@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Security screen: set the lock and auto-lock, manage webhooks, turn receipts on — via the system's admin prompt. @vhidvz
+- In-app Guide covering every feature, and a self-ticking getting-started checklist on the Overview. @vhidvz
+- Signed-receipt panel on results; Operations says whether the selected terminal's receipts are signed. @vhidvz
+- Settings explains each data file and can roll back to the previous AppImage version. @vhidvz
+- `posd admin --json`, `set-password --stdin` and `events enable|disable <id>`. @vhidvz
+- `GET /api/v1/events` adds `eventTypes` and `adminFile` (path, world-readable). @vhidvz
+
+### Fixed
+
+- Blank window on hosts with a new Mesa: the AppImage no longer bundles libwayland; CI checks it. @vhidvz
+
 ## [1.0.0] - 2026-10-14
 
 ### Added

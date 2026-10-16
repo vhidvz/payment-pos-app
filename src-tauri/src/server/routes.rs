@@ -684,10 +684,34 @@ struct EventsStatus {
     /// The latest delivery outcomes, newest first.
     recent: Vec<DeliveryRecord>,
     posture: crate::posture::Posture,
+    /// Every event type this version sends — what a subscription can filter on.
+    event_types: Vec<String>,
+    admin_file: AdminFileView,
+}
+
+/// Where the administrator file is, and whether every account can read it — which
+/// matters once it holds a hash or a secret (`posd admin status` says the same).
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminFileView {
+    path: String,
+    /// `null` where the platform cannot tell (Windows ACLs) or the file does not exist yet.
+    world_readable: Option<bool>,
+}
+
+fn admin_file_view(path: &std::path::Path) -> AdminFileView {
+    #[cfg(unix)]
+    let world_readable = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o004 != 0)
+    };
+    #[cfg(not(unix))]
+    let world_readable = None;
+    AdminFileView { path: path.display().to_string(), world_readable }
 }
 
 #[utoipa::path(get, path = "/api/v1/events", tag = "security",
-    responses((status = 200, description = "Webhook subscriptions (secrets withheld), receipt signing, delivery state and the device's posture", body = EventsStatus)))]
+    responses((status = 200, description = "Webhook subscriptions (secrets withheld), receipt signing, delivery state, the device's posture, the event types and the administrator file's permissions", body = EventsStatus)))]
 async fn events_status(State(state): State<AppState>) -> Json<EventsStatus> {
     let admin = state.auth.admin();
     Json(EventsStatus {
@@ -697,6 +721,8 @@ async fn events_status(State(state): State<AppState>) -> Json<EventsStatus> {
         pending: state.events.pending(),
         recent: state.events.recent(),
         posture: crate::posture::posture(&state.auth, &state.settings.get()),
+        event_types: events::types::ALL.iter().map(|t| t.to_string()).collect(),
+        admin_file: admin_file_view(state.auth.admin_file_path()),
     })
 }
 
@@ -887,6 +913,7 @@ async fn index() -> Json<Value> {
         FunctionSpec,
         crate::providers::ParamSpec,
         EventsStatus,
+        AdminFileView,
         SubscriptionView,
         DeliveryRecord,
         crate::posture::Posture,
@@ -1478,6 +1505,27 @@ mod tests {
         // The path is withheld too: a webhook URL can carry a token in it.
         assert_eq!(view["subscriptions"][0]["url"], "https://example.invalid/…");
         assert_eq!(view["receiptKeyId"], "k1");
+    }
+
+    /// The console builds its event picker and the file-permission warning from this.
+    #[tokio::test]
+    async fn the_events_view_lists_the_types_and_the_admin_file() {
+        let state = state_with_admin(AdminConfig::default());
+        let (_, view) = send(&state, "GET", "/api/v1/events", None, None).await;
+        let types: Vec<&str> = view["eventTypes"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(types, crate::events::types::ALL);
+        assert_eq!(view["adminFile"]["path"], state.auth.admin_file_path().display().to_string());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = state.auth.admin_file_path().to_path_buf();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let (_, view) = send(&state, "GET", "/api/v1/events", None, None).await;
+            assert_eq!(view["adminFile"]["worldReadable"], true);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let (_, view) = send(&state, "GET", "/api/v1/events", None, None).await;
+            assert_eq!(view["adminFile"]["worldReadable"], false);
+        }
     }
 
     /// A real delivery over HTTP to a local receiver that verifies the Standard

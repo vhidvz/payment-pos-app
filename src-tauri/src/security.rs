@@ -566,7 +566,9 @@ mod session_tests {
 /// What `posd admin …` was asked to do.
 #[derive(Debug, PartialEq)]
 pub enum AdminCommand {
-    SetPassword,
+    /// `set-password [--stdin]` — `--stdin` reads one line instead of prompting twice
+    /// on the terminal, for the console, which runs this under pkexec with no TTY.
+    SetPassword { stdin: bool },
     ClearPassword,
     AutoLock(u32),
     Status,
@@ -574,11 +576,24 @@ pub enum AdminCommand {
     EventsAdd { url: String, events: Vec<String> },
     EventsList,
     EventsRemove(String),
+    /// `events enable|disable <id>` — pause a subscription without losing its secret.
+    EventsEnable { id: String, enabled: bool },
     /// `events test [<id>]` — every subscription when no id is given.
     EventsTest(Option<String>),
     /// `receipt-key set [--kid <kid>]`
     ReceiptKeySet(Option<String>),
     ReceiptKeyClear,
+}
+
+/// Take `--json` when it comes right after `admin` — machine-readable output for the
+/// console. Anywhere else it is an ordinary argument (an id, a URL) and stays put.
+pub fn split_json_flag(args: &[String]) -> (Vec<String>, bool) {
+    if args.first().map(String::as_str) == Some("admin") && args.get(1).map(String::as_str) == Some("--json") {
+        let mut rest = args.to_vec();
+        rest.remove(1);
+        return (rest, true);
+    }
+    (args.to_vec(), false)
 }
 
 /// Parse the arguments after the binary name. `None` means "not an admin
@@ -587,11 +602,15 @@ pub fn parse_admin_command(args: &[String]) -> Option<Result<AdminCommand, Strin
     if args.first().map(String::as_str) != Some("admin") {
         return None;
     }
-    const USAGE: &str = "usage: posd admin <set-password|clear-password|auto-lock <minutes>|status>\n\
-       posd admin events <add <url> [--events <type,prefix.*,…>]|list|remove <id>|test [<id>]>\n\
-       posd admin receipt-key <set [--kid <id>]|clear>";
+    const USAGE: &str = "usage: posd admin [--json] <set-password [--stdin]|clear-password|auto-lock <minutes>|status>\n\
+       posd admin [--json] events <add <url> [--events <type,prefix.*,…>]|list|remove <id>|enable <id>|disable <id>|test [<id>]>\n\
+       posd admin [--json] receipt-key <set [--kid <id>]|clear>";
     Some(match args.get(1).map(String::as_str) {
-        Some("set-password") => Ok(AdminCommand::SetPassword),
+        Some("set-password") => match args.get(2).map(String::as_str) {
+            None => Ok(AdminCommand::SetPassword { stdin: false }),
+            Some("--stdin") if args.len() == 3 => Ok(AdminCommand::SetPassword { stdin: true }),
+            Some(other) => Err(format!("set-password takes only '--stdin', not '{other}'\n{USAGE}")),
+        },
         Some("clear-password") => Ok(AdminCommand::ClearPassword),
         Some("status") => Ok(AdminCommand::Status),
         Some("events") => parse_events(&args[2..]).map_err(|e| format!("{e}\n{USAGE}")),
@@ -652,8 +671,12 @@ fn parse_events(rest: &[String]) -> Result<AdminCommand, String> {
             .get(1)
             .map(|id| AdminCommand::EventsRemove(id.trim().to_string()))
             .ok_or_else(|| "events remove needs a subscription id".to_string()),
+        Some(verb @ ("enable" | "disable")) => rest
+            .get(1)
+            .map(|id| AdminCommand::EventsEnable { id: id.trim().to_string(), enabled: verb == "enable" })
+            .ok_or_else(|| format!("events {verb} needs a subscription id")),
         Some("test") => Ok(AdminCommand::EventsTest(rest.get(1).map(|s| s.trim().to_string()))),
-        _ => Err("events takes add, list, remove or test".into()),
+        _ => Err("events takes add, list, remove, enable, disable or test".into()),
     }
 }
 
@@ -686,6 +709,19 @@ pub fn remove_subscription_at(path: &Path, id: &str) -> Result<(), String> {
         return Err(format!("no subscription '{id}' (see `posd admin events list`)"));
     }
     amend(path, |cfg| cfg.events.subscriptions.retain(|s| s.id != id))
+}
+
+/// Turn one subscription's deliveries on or off, keeping its secret and filters.
+pub fn set_subscription_enabled_at(path: &Path, id: &str, enabled: bool) -> Result<(), String> {
+    // `try_load_from`: a file that does not parse says so, not "no subscription".
+    if !try_load_from(path)?.events.subscriptions.iter().any(|s| s.id == id) {
+        return Err(format!("no subscription '{id}' (see `posd admin events list`)"));
+    }
+    amend(path, |cfg| {
+        for s in cfg.events.subscriptions.iter_mut().filter(|s| s.id == id) {
+            s.enabled = enabled;
+        }
+    })
 }
 
 /// Set — or rotate — the receipt key; answers it **with its secret**, shown once.
@@ -839,7 +875,7 @@ mod admin_cli_tests {
 
     #[test]
     fn admin_subcommands_parse() {
-        assert_eq!(parse_admin_command(&args(&["admin", "set-password"])), Some(Ok(AdminCommand::SetPassword)));
+        assert_eq!(parse_admin_command(&args(&["admin", "set-password"])), Some(Ok(AdminCommand::SetPassword { stdin: false })));
         assert_eq!(parse_admin_command(&args(&["admin", "clear-password"])), Some(Ok(AdminCommand::ClearPassword)));
         assert_eq!(parse_admin_command(&args(&["admin", "status"])), Some(Ok(AdminCommand::Status)));
         assert_eq!(parse_admin_command(&args(&["admin", "auto-lock", "30"])), Some(Ok(AdminCommand::AutoLock(30))));
@@ -1034,6 +1070,53 @@ mod events_admin_tests {
         remove_subscription_at(&p, &sub.id).unwrap();
         assert!(load_from(&p).events.subscriptions.is_empty());
         assert_eq!(load_from(&p).events.device_id, cfg.events.device_id, "the device keeps its id");
+    }
+
+    /// The console runs `posd admin` under pkexec, where there is no terminal to
+    /// prompt on: the password comes on stdin and the answer as JSON.
+    #[test]
+    fn console_flags_parse() {
+        assert_eq!(
+            parse_admin_command(&args(&["admin", "set-password", "--stdin"])),
+            Some(Ok(AdminCommand::SetPassword { stdin: true }))
+        );
+        assert!(matches!(parse_admin_command(&args(&["admin", "set-password", "--stdn"])), Some(Err(_))));
+        assert_eq!(
+            parse_admin_command(&args(&["admin", "events", "disable", "sub_1"])),
+            Some(Ok(AdminCommand::EventsEnable { id: "sub_1".into(), enabled: false }))
+        );
+        assert_eq!(
+            parse_admin_command(&args(&["admin", "events", "enable", "sub_1"])),
+            Some(Ok(AdminCommand::EventsEnable { id: "sub_1".into(), enabled: true }))
+        );
+        assert!(matches!(parse_admin_command(&args(&["admin", "events", "enable"])), Some(Err(_))));
+    }
+
+    #[test]
+    fn the_json_flag_is_taken_only_right_after_admin() {
+        assert_eq!(split_json_flag(&args(&["admin", "--json", "status"])), (args(&["admin", "status"]), true));
+        assert_eq!(split_json_flag(&args(&["admin", "status"])), (args(&["admin", "status"]), false));
+        // A URL or an id that happens to read `--json` is an argument, not the flag.
+        assert_eq!(
+            split_json_flag(&args(&["admin", "events", "remove", "--json"])),
+            (args(&["admin", "events", "remove", "--json"]), false)
+        );
+        assert_eq!(split_json_flag(&args(&["--json"])), (args(&["--json"]), false));
+    }
+
+    #[test]
+    fn disabling_a_subscription_flips_only_that_one() {
+        let p = tmp_admin();
+        let a = add_subscription_at(&p, "https://h/a", vec!["*".into()]).unwrap();
+        let b = add_subscription_at(&p, "https://h/b", vec!["*".into()]).unwrap();
+        set_subscription_enabled_at(&p, &a.id, false).unwrap();
+        let subs = load_from(&p).events.subscriptions;
+        assert!(!subs.iter().find(|s| s.id == a.id).unwrap().enabled);
+        assert!(subs.iter().find(|s| s.id == b.id).unwrap().enabled);
+        assert_eq!(subs.iter().find(|s| s.id == a.id).unwrap().secret, a.secret, "the secret survives");
+        set_subscription_enabled_at(&p, &a.id, true).unwrap();
+        assert!(load_from(&p).events.subscriptions.iter().all(|s| s.enabled));
+        assert!(set_subscription_enabled_at(&p, "nope", true).is_err());
     }
 
     #[test]

@@ -309,3 +309,34 @@ html.fx-lite .shadow-glow-brass {
 html.fx-lite .btn-primary {
   box-shadow: none;
 }
+
+/* "Learn more" disclosures: a quiet line that opens into the detail. */
+.disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  font-size: 0.75rem;
+  color: var(--color-brass-400);
+  transition: color 0.2s;
+}
+.disclosure::-webkit-details-marker {
+  display: none;
+}
+.disclosure::before {
+  content: '';
+  width: 0.4rem;
+  height: 0.4rem;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.2s;
+}
+details[open] > .disclosure::before {
+  transform: rotate(45deg);
+}
+.disclosure:hover {
+  color: var(--color-brass-300);
+}

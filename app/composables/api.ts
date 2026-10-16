@@ -153,6 +153,47 @@ export interface SystemInfo {
   notice: NoticeView | null
 }
 
+/** A webhook subscription as the API shows it: the URL cut to scheme and host, no secret. */
+export interface SubscriptionView {
+  id: string
+  url: string
+  events: string[]
+  enabled: boolean
+}
+
+export interface DeliveryRecord {
+  at: string
+  msgId: string
+  eventType: string
+  subscription: string
+  /** `delivered`, `retrying`, `gone` (410), `expired` (72 h) or `orphaned` (subscription removed). */
+  outcome: string
+  attempts: number
+  detail?: string
+}
+
+/** What a receiver learns about this machine with every event and signed receipt. */
+export interface Posture {
+  passwordSet: boolean
+  unlocked: boolean
+  autoLockMinutes: number
+  securityDigest: string
+  activeProvider: string
+}
+
+export interface EventsStatus {
+  deviceId: string | null
+  subscriptions: SubscriptionView[]
+  receiptKeyId: string | null
+  pending: number
+  recent: DeliveryRecord[]
+  posture: Posture
+  /** Every event type this version can send. */
+  eventTypes: string[]
+  /** `worldReadable` is null where the platform cannot tell (Windows). */
+  adminFile: { path: string; worldReadable: boolean | null }
+}
+
 export class ApiError extends Error {
   code: string
   status: number
@@ -165,7 +206,9 @@ export class ApiError extends Error {
 
 // ------------------------------------------------------------- base URL
 
-const FALLBACK_BASE = 'http://127.0.0.1:4373'
+// Outside the desktop shell (`pnpm dev` in a browser): the default port, or another API
+// named by VITE_LEDGER_API — e.g. a second `posd` started on a spare port for testing.
+const FALLBACK_BASE: string = import.meta.env.VITE_LEDGER_API || 'http://127.0.0.1:4373'
 
 function inTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -256,6 +299,8 @@ export function useApi() {
         params,
       ),
     activity: (limit = 50) => request<ActivityEntry[]>('GET', `/api/v1/activity?limit=${limit}`),
+
+    events: () => request<EventsStatus>('GET', '/api/v1/events'),
 
     authStatus: () => request<AuthStatus>('GET', '/api/v1/auth/status'),
     unlock: (password: string) =>

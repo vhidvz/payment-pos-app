@@ -104,6 +104,13 @@ jobs:
           releaseBody: ${{ env.NOTES }}
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+      # A bundled libwayland stops a newer host Mesa from loading its EGL and the window stays
+      # blank (`Could not create default EGL display`). scripts/prepare-appimage-plugin.mjs
+      # removes it; this fails the run if it is ever back — the release is a draft, so a red
+      # run here means: do not publish it.
+      - name: Check the AppImage
+        if: runner.os == 'Linux'
+        run: node scripts/check-appimage.mjs
       - name: Upload bundles (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
