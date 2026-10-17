@@ -132,6 +132,9 @@ fn active_provider(state: &AppState) -> Result<std::sync::Arc<dyn Provider>, Api
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    /// `posd` — the one process that serves this API. A prober checks it before trusting
+    /// `version`.
+    pub process: String,
     pub uptime_secs: u64,
 }
 
@@ -243,6 +246,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".into(),
         version: env!("CARGO_PKG_VERSION").into(),
+        process: crate::version::process_name().into(),
         uptime_secs: state.started_at.elapsed().as_secs(),
     })
 }
@@ -1032,6 +1036,16 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let (status, _) = send(&state, "GET", "/api/v1/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The console's supervisor tells `posd` apart from anything else on the port by this.
+    #[tokio::test]
+    async fn health_names_the_process() {
+        let state = test_state();
+        let (status, body) = send(&state, "GET", "/api/v1/health", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["process"], crate::version::process_name());
+        assert_eq!(body["version"], crate::version::VERSION);
     }
 
     /// An invoke already running when the drain starts completes normally, and the drain

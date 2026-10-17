@@ -2,7 +2,7 @@
 # End-to-end proof of the update path (spec §8), isolated from the machine's real install.
 #
 #   OLD=<1.0.0 e2e AppImage> NEW=<1.0.1-test e2e AppImage> OUT=<evidence dir> \
-#   [LEGACY=<pre-1.0 AppImage>] [LEGACY_POSD=<pre-1.0 posd, named exactly `posd`>] scripts/e2e/update.sh
+#   [LEGACY=<pre-1.0 AppImage>] [LEGACY_POSD=<a pre-1.2 posd, named exactly `posd`>] scripts/e2e/update.sh
 #
 # e2e AppImages are built with `--features e2e`, the only build in which LEDGER_POS_ADMIN_PATH
 # moves the administrator file. Every scenario runs in its own temp HOME and XDG dirs, on a
@@ -13,6 +13,11 @@
 # selector> in update mode, clicking that element through the webview ~4 s after the window
 # opens (e.g. "button.btn-primary" for Update and restart) — injected pointer input does not
 # reach windows on every desktop.
+#
+# From 1.2 the API is `posd`'s alone, run as a background service the console manages. Every
+# scenario forces LEDGER_POS_DAEMON=detached (and LEDGER_POS_LINGER=0): the systemd user
+# manager is the machine's real one, whose unit directory a temp HOME cannot redirect, so the
+# harness must never reach it. Stopping "the API" therefore means stopping that posd too.
 set -euo pipefail
 
 say() { printf '\n== %s\n' "$*"; }
@@ -63,6 +68,7 @@ fresh_home() {
   mkdir -p "$h"
   export HOME="$h" XDG_CONFIG_HOME="$h/.config" XDG_DATA_HOME="$h/.local/share" XDG_CACHE_HOME="$h/.cache"
   export LEDGER_POS_ADMIN_PATH="$h/admin.json"
+  export LEDGER_POS_DAEMON=detached LEDGER_POS_LINGER=0
   PORT=$(free_port)
   mkdir -p "$XDG_CONFIG_HOME/ledger-pos"
   # A pre-1.0 settings file: no schemaVersion.
@@ -84,7 +90,12 @@ wait_down() {
   fail "API on :$PORT still up"
 }
 start_installed() { setsid "$HOME/.local/bin/ledger-pos.AppImage" --background >>"$ROOT/app.log" 2>&1 < /dev/null & }
-stop_installed() { "$HOME/.local/bin/ledger-pos.AppImage" --quit-for-update >>"$ROOT/app.log" 2>&1 || true; wait_down; }
+# The console, then this HOME's detached posd (1.2+): the API is down only when both are.
+stop_installed() {
+  "$HOME/.local/bin/ledger-pos.AppImage" --quit-for-update >>"$ROOT/app.log" 2>&1 || true
+  pkill -TERM -f "^$HOME/.local/bin/posd" || true
+  wait_down
+}
 key() { grep -o 'X-LedgerPOS-Version=.*' "$XDG_DATA_HOME/applications/ledger-pos.desktop" | cut -d= -f2; }
 cfg() { cat "$XDG_CONFIG_HOME/ledger-pos/$1"; }
 port_pid() { ss -ltnpH "sport = :$PORT" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2; }
@@ -142,27 +153,18 @@ scenario_legacy() {
 }
 
 scenario_legacy_posd() {
-  say "C: a pre-1.0 posd running on its own blocks the update until stopped"
+  say "C: a posd from before 1.2, running on its own, is replaced by the update — no refusal"
   fresh_home c
   "$OLD" --install
   setsid "$LEGACY_POSD" >>"$ROOT/c-posd.log" 2>&1 < /dev/null &
   local posd=$!
   for _ in $(seq 1 60); do [ -n "$(version_on_port)" ] && break; sleep 0.5; done
-  set +e; "$NEW" --update > "$ROOT/c-update-1.log" 2>&1; local code=$?; set -e
-  [ "$code" = 4 ] || fail "expected exit 4 while posd runs, got $code"
-  grep -q 'posd is running' "$ROOT/c-update-1.log" || fail "no posd message"
-  [ "$(key)" = 1.0.0 ] || fail "the install changed while posd ran"
-  kill -TERM "$posd"; wait_down
-  "$NEW" --update | tee "$ROOT/c-update-2.log"
+  "$NEW" --update | tee "$ROOT/c-update.log"
   wait_version 1.0.1-test
+  kill -0 "$posd" 2>/dev/null && fail "the old posd still runs beside the new one"
+  grep -q '\[Service\] Done' "$ROOT/c-update.log" || fail "the update did not restart the background API"
+  [ "$(key)" = 1.0.1-test ] || fail "the install did not change"
   stop_installed
-  local before; before=$(cfg state.json | json 'v.migrations.length')
-  setsid "$HOME/.local/bin/posd" >>"$ROOT/c-posd.log" 2>&1 < /dev/null &
-  local newposd=$!
-  wait_version 1.0.1-test
-  kill -TERM "$newposd"; wait_down
-  [ "$(cfg state.json | json 'v.migrations.length')" = "$before" ] || fail "the new posd migrated again"
-  [ "$(cfg state.json | json 'v.app.lastRunVersion')" = 1.0.1-test ] || fail "posd touched app"
   echo "C PASS"
 }
 

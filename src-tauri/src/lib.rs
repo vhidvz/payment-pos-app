@@ -1,13 +1,14 @@
 //! Ledger POS — desktop shell.
 //!
-//! The Tauri layer is deliberately thin: all real functionality (settings,
-//! providers, REST API) lives in the library so the headless `posd` binary can
-//! reuse it. The shell adds: window + tray, minimize-to-tray on close,
-//! start-at-boot syncing, single-instance focus, and a couple of UI commands.
+//! The Tauri layer is deliberately thin, and it serves nothing: the REST API is the
+//! headless `posd` binary's alone, run as a background service ([`daemon`]). The shell is
+//! the console — window + tray, minimize-to-tray on close, start-at-boot syncing,
+//! single-instance focus — and the manager that keeps `posd` installed and answering.
 
 pub mod activity;
 pub mod admission;
 pub mod cli;
+pub mod daemon;
 pub mod elevate;
 pub mod events;
 pub mod fsutil;
@@ -77,7 +78,45 @@ pub fn build_state() -> AppState {
         run_state.note_app_start(version::VERSION);
     }
     state.run_state = run_state;
+    state.serving_file = Some(server::serving_path());
     state
+}
+
+// ------------------------------------------------------------- the console
+
+/// What the console holds. It serves nothing: `posd` owns the API, the settings file and
+/// the webhook outbox; the console reads settings ([`settings::peek`]) and manages `posd`.
+#[derive(Clone)]
+struct Shell {
+    /// Drain gate for the console's own commands (install, rollback…) — an update waits on it.
+    admission: Arc<admission::Admission>,
+    /// `state.json`'s `app` section is the one file the console writes (locked, re-read).
+    run_state: Arc<runstate::StateStore>,
+    daemon: Arc<daemon::supervisor::Supervisor>,
+    /// This start installed the AppImage by itself; the frontend says so once.
+    just_installed: bool,
+}
+
+fn current_settings() -> settings::Settings {
+    settings::peek(&settings::settings_path())
+}
+
+/// The first run of an AppImage with nothing installed installs it — the background API
+/// needs a `posd` that outlives this file's mount. Nothing to ask: it is all in the user's
+/// home, and Settings can remove it again.
+fn auto_install() -> bool {
+    let Some(source) = install::Source::detect() else { return false };
+    let layout = install::Layout::current();
+    if !matches!(install::installed(&layout), install::Installed::None) {
+        return false;
+    }
+    match install::install(&layout, &source) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("could not install this AppImage ({e}); the API runs only while it is open");
+            false
+        }
+    }
 }
 
 // --------------------------------------------------------- desktop install
@@ -91,64 +130,80 @@ struct InstallInfo {
     installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     installed_path: Option<String>,
-    /// The offer has already been answered once.
-    prompt_dismissed: bool,
+    /// This start installed it, unasked.
+    just_installed: bool,
     /// The version kept for one rollback, when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_version: Option<String>,
 }
 
-fn install_info(state: &AppState) -> InstallInfo {
+fn install_info(shell: &Shell) -> InstallInfo {
     let layout = install::Layout::current();
     InstallInfo {
         available: install::Source::detect().is_some(),
         installed: install::is_installed(&layout),
         installed_path: install::is_installed(&layout)
             .then(|| layout.app_path().display().to_string()),
-        prompt_dismissed: state.settings.get().app.install_prompt_dismissed,
+        just_installed: shell.just_installed,
         previous_version: install::txn::previous_version(&layout),
     }
 }
 
 #[tauri::command]
-fn install_status(state: tauri::State<'_, AppState>) -> InstallInfo {
-    install_info(&state)
+fn install_status(shell: tauri::State<'_, Shell>) -> InstallInfo {
+    install_info(&shell)
 }
 
+/// Settings' "Install" — after an uninstall, or when the automatic install failed.
 #[tauri::command]
-fn install_app(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<InstallInfo, String> {
-    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
+fn install_app(app: AppHandle, shell: tauri::State<'_, Shell>) -> Result<InstallInfo, String> {
+    let _ticket = shell.admission.enter().map_err(|_| "updating".to_string())?;
     let source = install::Source::detect()
         .ok_or("this build is not an AppImage, so there is nothing to integrate")?;
     let layout = install::Layout::current();
     install::install(&layout, &source)?;
-    let _ = state.settings.update(|s| s.app.install_prompt_dismissed = true);
-    // An autostart entry written before the install still points at wherever the
-    // AppImage was downloaded; move it to the copy that is now permanent.
-    if state.settings.get().app.start_at_boot {
+    // An autostart entry written before the install points at the downloaded file.
+    if current_settings().app.start_at_boot {
         sync_autostart(&app, true);
     }
-    Ok(install_info(&state))
+    // After an uninstall this session ran posd as its child; now it is a service again.
+    shell.daemon.restore();
+    Ok(install_info(&shell))
 }
 
 #[tauri::command]
-fn uninstall_app(state: tauri::State<'_, AppState>) -> Result<InstallInfo, String> {
-    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
-    install::uninstall(&install::Layout::current())?;
-    Ok(install_info(&state))
+async fn uninstall_app(app: AppHandle) -> Result<InstallInfo, String> {
+    let shell = app.state::<Shell>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ticket = shell.admission.enter().map_err(|_| "updating".to_string())?;
+        let posd = daemon::real::target_for(false).exe;
+        install::uninstall(&install::Layout::current())?;
+        // The service ran the copy just removed; until this window closes, ours serves.
+        shell.daemon.go_ephemeral(&posd);
+        Ok(install_info(&shell))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// `--rollback` from the console: the previous version goes back on the menu and runs from
-/// the next start. Refused while `posd` runs, like the command — it may be that version.
+/// the next start; the background service moves onto its `posd` now (or, for a version from
+/// before the service, is removed — that version serves from its own window).
 #[tauri::command]
-fn rollback_install(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    use update::system::System;
-    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
-    let pids = update::system::RealSystem::new().posd_pids();
-    if !pids.is_empty() {
-        return Err(update::engine::posd_message(&pids));
-    }
-    install::rollback(&install::Layout::current())
+async fn rollback_install(app: AppHandle) -> Result<String, String> {
+    let shell = app.state::<Shell>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ticket = shell.admission.enter().map_err(|_| "updating".to_string())?;
+        let posd = daemon::real::target_for(false).exe;
+        let version = install::rollback(&install::Layout::current())?;
+        match semver::Version::parse(&version) {
+            Ok(v) if (v.major, v.minor) < daemon::DAEMON_SINCE => shell.daemon.go_ephemeral(&posd),
+            _ => shell.daemon.wake(),
+        }
+        Ok(version)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ------------------------------------------------------- administrator actions
@@ -170,17 +225,6 @@ async fn admin_run(op: elevate::AdminOp) -> elevate::AdminRunResult {
         })
 }
 
-/// Remember that the offer was declined, so it is made once and not again.
-#[tauri::command]
-fn dismiss_install_prompt(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
-    state
-        .settings
-        .update(|s| s.app.install_prompt_dismissed = true)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
 // ---------------------------------------------------- versions and updates
 
 #[tauri::command]
@@ -188,15 +232,16 @@ fn boot_mode(info: tauri::State<'_, update::BootInfo>) -> update::BootInfo {
     info.inner().clone()
 }
 
+/// Read fresh: `posd` records the migrations it performs after the console started.
 #[tauri::command]
-fn version_notice(state: tauri::State<'_, AppState>) -> Option<runstate::NoticeView> {
-    state.run_state.notice()
+fn version_notice() -> Option<runstate::NoticeView> {
+    runstate::StateStore::open(runstate::state_path()).notice()
 }
 
 #[tauri::command]
-fn ack_version_notice(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let _ticket = state.admission.enter().map_err(|_| "updating".to_string())?;
-    state.run_state.ack()
+fn ack_version_notice(shell: tauri::State<'_, Shell>) -> Result<(), String> {
+    let _ticket = shell.admission.enter().map_err(|_| "updating".to_string())?;
+    shell.run_state.ack()
 }
 
 /// The update screen's world: where to install, and the machine it acts on.
@@ -241,7 +286,8 @@ async fn relaunch_update(app: AppHandle) -> Result<update::engine::EngineOutcome
 async fn rollback_update(app: AppHandle) -> Result<update::engine::EngineOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let ctx = app.state::<UpdateCtx>();
-        install::rollback(&ctx.layout)?;
+        let version = install::rollback(&ctx.layout)?;
+        let _ = daemon::real::after_rollback(&version);
         let t = update::engine::Timeouts::default();
         Ok(update::engine::relaunch(&ctx.sys, &ctx.layout, &t, &mut emitter(&app)))
     })
@@ -269,6 +315,7 @@ fn quit_app(app: AppHandle) {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct UiServerInfo {
+    /// The background service answers on the configured address.
     running: bool,
     host: String,
     port: u16,
@@ -277,38 +324,37 @@ struct UiServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     version: String,
+    /// How `posd` runs and what the last check found.
+    service: daemon::Status,
 }
 
-fn ui_server_info(state: &AppState) -> UiServerInfo {
-    let status = state.status();
-    let settings = state.settings.get();
-    let (host, port) = if status.running {
-        (status.host.clone(), status.port)
-    } else {
-        (settings.server.host.clone(), settings.server.port)
-    };
-    // A wildcard bind address is not a connectable URL.
-    let connect_host = if host == "0.0.0.0" || host == "::" { "127.0.0.1".to_string() } else { host.clone() };
+fn ui_server_info(shell: &Shell) -> UiServerInfo {
+    // Where posd really serves — after a failed port change, the last address that worked —
+    // so the console can always reach it to put the settings right.
+    let (host, port) = daemon::real::api_endpoint();
+    let service = shell.daemon.status();
+    let connect_host = if host.contains(':') { format!("[{host}]") } else { host.clone() };
     let base_url = format!("http://{connect_host}:{port}");
     UiServerInfo {
-        running: status.running,
+        running: service.state == "serving",
         host,
         port,
         docs_url: format!("{base_url}/docs"),
         base_url,
-        error: status.error,
+        error: service.detail.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
+        service,
     }
 }
 
 #[tauri::command]
-fn server_info(state: tauri::State<'_, AppState>) -> UiServerInfo {
-    ui_server_info(&state)
+fn server_info(shell: tauri::State<'_, Shell>) -> UiServerInfo {
+    ui_server_info(&shell)
 }
 
 #[tauri::command]
-fn open_docs(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let info = ui_server_info(&state);
+fn open_docs(app: AppHandle, shell: tauri::State<'_, Shell>) -> Result<(), String> {
+    let info = ui_server_info(&shell);
     app.opener()
         .open_url(info.docs_url, None::<&str>)
         .map_err(|e| e.to_string())
@@ -328,7 +374,8 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Open Ledger POS", true, None::<&str>)?;
     let docs = MenuItem::with_id(app, "docs", "API documentation", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    // The API is `posd`'s: quitting the console leaves it serving.
+    let quit = MenuItem::with_id(app, "quit", "Close console (the API keeps running)", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &docs, &sep, &quit])?;
 
     TrayIconBuilder::with_id("main-tray")
@@ -339,16 +386,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
             "docs" => {
-                let state = app.state::<AppState>();
-                let url = ui_server_info(&state).docs_url;
+                let url = ui_server_info(&app.state::<Shell>()).docs_url;
                 let _ = app.opener().open_url(url, None::<&str>);
             }
-            "quit" => {
-                // Best effort: give `app.stopping` a moment to reach its subscribers.
-                let state = app.state::<AppState>().inner().clone();
-                tauri::async_runtime::block_on(events::shutdown(&state, std::time::Duration::from_secs(3)));
-                app.exit(0)
-            }
+            "quit" => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -384,22 +425,14 @@ fn apply_autostart(app: &AppHandle, enabled: bool) -> std::io::Result<()> {
             _ => Ok(()),
         };
     }
+    let layout = install::Layout::current();
     let exe = match app.env().appimage {
+        // The installed copy when there is one, not the file it was installed from.
+        Some(_) if install::is_installed(&layout) => layout.app_path(),
         // The AppImage path, not the transient /tmp/.mount_* exe inside it.
         Some(appimage) => std::path::PathBuf::from(appimage),
         None => std::env::current_exe()?,
     };
-    // Desktop Entry spec: arguments containing spaces must be double-quoted,
-    // with the characters that stay special inside quotes backslash-escaped.
-    let quoted = format!(
-        "\"{}\"",
-        exe.display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('`', "\\`")
-            .replace('$', "\\$")
-    );
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         &file,
@@ -408,10 +441,11 @@ fn apply_autostart(app: &AppHandle, enabled: bool) -> std::io::Result<()> {
              Type=Application\n\
              Version=1.0\n\
              Name={name}\n\
-             Comment={name} — start in the tray at login\n\
-             Exec={quoted} --background\n\
+             Comment={name} — the console in the tray at login (the API runs regardless)\n\
+             Exec={} --background\n\
              StartupNotify=false\n\
-             Terminal=false\n"
+             Terminal=false\n",
+            install::quote_exec(&exe)
         ),
     )
 }
@@ -478,9 +512,8 @@ pub fn run() {
     }
 }
 
-/// An update screen instead of the app (spec §3.1): no single-instance, no API server, no
-/// tray, no events — and no settings loaded, so nothing migrates until the new version
-/// runs installed.
+/// An update screen instead of the app (spec §3.1): no single-instance, no tray — and no
+/// settings loaded, so nothing migrates until the new version's `posd` runs.
 fn run_update_mode(boot: update::Boot, layout: install::Layout) {
     use update::system::System;
     let sys = update::system::RealSystem::new();
@@ -521,20 +554,28 @@ fn run_update_mode(boot: update::Boot, layout: install::Layout) {
 }
 
 fn run_normal(background: bool) {
-    let state = build_state();
+    let just_installed = auto_install();
+    let run_state = Arc::new(runstate::StateStore::open(runstate::state_path()));
+    run_state.note_app_start(version::VERSION);
+    let shell = Shell {
+        admission: Arc::new(admission::Admission::new()),
+        run_state,
+        daemon: daemon::supervisor::Supervisor::new(),
+        just_installed,
+    };
+    let daemon = shell.daemon.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if args.iter().any(|a| a == update::system::QUIT_FOR_UPDATE) {
-                // An update is replacing this copy (spec §3.4): stop admitting changes, let
-                // what was admitted finish, announce `app.stopping`, then exit.
-                let state = app.state::<AppState>().inner().clone();
+                // An update is replacing this copy (spec §3.4): let the console's own commands
+                // finish, then exit. The API is `posd`'s; the update restarts it.
+                let shell = app.state::<Shell>().inner().clone();
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    if !state.admission.drain(std::time::Duration::from_secs(300)).await {
-                        tracing::warn!("drain cap reached; exiting with requests still in flight");
+                    if !shell.admission.drain(std::time::Duration::from_secs(300)).await {
+                        tracing::warn!("drain cap reached; exiting with a command still running");
                     }
-                    events::shutdown(&state, std::time::Duration::from_secs(3)).await;
                     handle.exit(0);
                 });
             } else {
@@ -547,7 +588,7 @@ fn run_normal(background: bool) {
             Some(vec!["--background"]),
         ))
         .plugin(tauri_plugin_opener::init())
-        .manage(state.clone())
+        .manage(shell.clone())
         .manage(update::BootInfo::normal())
         .invoke_handler(tauri::generate_handler![
             server_info,
@@ -555,7 +596,6 @@ fn run_normal(background: bool) {
             install_status,
             install_app,
             uninstall_app,
-            dismiss_install_prompt,
             rollback_install,
             admin_preview,
             admin_run,
@@ -564,23 +604,22 @@ fn run_normal(background: bool) {
             ack_version_notice
         ])
         .setup(move |app| {
-            // REST API — runs for the app's whole life, window shown or not.
-            tauri::async_runtime::spawn(server::run_server(state.clone()));
-            // Webhook events: idle unless an administrator configured a subscription.
-            tauri::async_runtime::spawn(events::run(state.clone()));
+            // The API: `posd`, installed and kept answering. The console binds nothing.
+            shell.daemon.start();
 
             build_tray(app)?;
 
-            // Make the OS autostart entry follow the setting, now and on change.
-            let app_settings = state.settings.get().app;
+            // Make the OS autostart entry follow the setting — `posd` writes the file, so
+            // watch it rather than a channel.
+            let app_settings = current_settings().app;
             sync_autostart(app.handle(), app_settings.start_at_boot);
             {
                 let handle = app.handle().clone();
-                let mut rx = state.settings.subscribe();
-                tauri::async_runtime::spawn(async move {
-                    let mut last = rx.borrow().app.start_at_boot;
-                    while rx.changed().await.is_ok() {
-                        let now = rx.borrow().app.start_at_boot;
+                std::thread::spawn(move || {
+                    let mut last = app_settings.start_at_boot;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let now = current_settings().app.start_at_boot;
                         if now != last {
                             last = now;
                             sync_autostart(&handle, now);
@@ -599,13 +638,17 @@ fn run_normal(background: bool) {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let state = window.state::<AppState>();
-                if state.settings.get().app.minimize_to_tray_on_close {
+                if current_settings().app.minimize_to_tray_on_close {
                     api.prevent_close();
                     let _ = window.hide();
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(move |_, event| {
+        if let tauri::RunEvent::Exit = event {
+            daemon.shutdown();
+        }
+    });
 }

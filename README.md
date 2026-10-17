@@ -2,8 +2,9 @@
 
 Turns a payment terminal into a **local REST API**. Your till, web shop or script
 asks for a payment, the customer taps their card, you get the receipt back as
-JSON. A desktop console comes with it for setup and monitoring, and keeps serving
-from the system tray once you close the window.
+JSON. The API is served by `posd`, a background service that starts at login and
+keeps running with or without a window; the desktop console that comes with it is
+for setup and monitoring, and installs and looks after `posd` by itself.
 
 Drives the **Saman SSP1126**. A built-in **sandbox** terminal simulates the same
 operations so you can build your integration without hardware.
@@ -43,7 +44,7 @@ on Windows 11). Build on Windows itself — Tauri cannot cross-compile there fro
 Linux.
 
 On Linux, `libappindicator` is what draws the tray icon; without it, closing the
-window leaves you no way back to the app.
+window leaves you no way back to the console (the API keeps serving).
 
 ### 2. Build
 
@@ -65,8 +66,8 @@ workflow runs it on every build.
 ### 3. Install and start
 
 **Arch, Manjaro, and every other Linux — use the AppImage.** Make it executable
-and open it. The first time it runs it offers to add itself to your applications
-menu; accept, and you are done. Nothing needs a password.
+and open it. The first time it runs it installs itself and starts the background
+API; you are done. Nothing needs a password.
 
 ```sh
 cd src-tauri/target/release/bundle/appimage
@@ -75,8 +76,11 @@ chmod +x "Ledger POS_<version>_amd64.AppImage"
 ```
 
 It copies itself to `~/.local/bin/ledger-pos.AppImage`, writes the menu entry and
-icons, and puts `posd` beside it — all in your home directory. From then on
-launch **Ledger POS** from the menu; the offer is never made again.
+icons, puts `posd` beside it and runs it as the systemd user service `posd.service`
+(started at login, and at boot where logind allows it; restarted if it stops) — all
+in your home directory. From then on the API simply answers; launch **Ledger POS**
+from the menu when you want the console. On a machine without a desktop,
+`./"Ledger POS_<version>_amd64.AppImage" --install` does the same from a terminal.
 
 The same thing without the window, for setting up several machines:
 
@@ -115,11 +119,11 @@ its place — from the menu, as before. The same from a terminal, for scripts:
 ~/.local/bin/ledger-pos.AppImage --rollback        # the previous version, kept for one rollback
 ```
 
-`posd` must not be running while it updates — stop its service first; started again, it runs the
-new version. Opening an *older* file never replaces a newer install; `--install --allow-downgrade`
-does, on purpose.
+The update lets the payment in progress finish, then restarts the background API on the new
+version by itself. Opening an *older* file never replaces a newer install; `--install
+--allow-downgrade` does, on purpose.
 
-**Packages:** install the new `.deb`, `.rpm` or `.msi` over the old one.
+**Packages:** install the new `.deb`, `.rpm` or `.msi` over the old one; the next start of the console moves the background API onto it.
 
 Either way your settings carry over. On the first start each data file is brought up to date and
 the original is kept beside it as `<file>.v<N>.bak`; the console says once what changed. A file
@@ -198,9 +202,12 @@ stands. Changing the API host/port rebinds immediately; if the new address
 cannot be used it falls back to the last working one and reports why in
 `/api/v1/system`, so you cannot lock yourself out.
 
-Closing the window keeps the API serving from the tray. *Settings → Start at
-boot* launches it hidden at login. Or run `posd` with no desktop at all — same
-API, same port, so run one or the other.
+Only `posd` ever listens on the API port — the console binds nothing, so the two
+never compete for it. Closing or quitting the window leaves the API serving;
+*Settings → Open in the tray at login* brings the console back to the tray at login.
+Without systemd the console starts `posd` itself (and at login through an XDG
+autostart entry); a debug build keeps it as a child of the window
+(`LEDGER_POS_DAEMON=service|detached|child` overrides).
 
 ## Locking the app
 
@@ -339,7 +346,7 @@ because the posture travels with every sale.
 | Connection test fails but payments work | Some terminals ignore the test message; the app checks a second way, so a failure here is real. |
 | `409 busy` | One transaction at a time — wait for the previous one. |
 | A transaction occasionally takes ~20s | The terminal sometimes ignores the opening message; the app re-sends it automatically. Raise **firstAckAttempts** on the provider page if it still gives up. |
-| API did not start | Port taken, or the app and `posd` are both running. See `/api/v1/system`. |
+| API offline | Another program holds the port, or `posd` is still starting — the console's sidebar says which. `systemctl --user status posd` shows the service. |
 | Forgot the password | *Security → Remove password*, or `sudo posd admin clear-password` on the machine. |
 | Blank window right after start (Linux AppImage 1.0.0) | That AppImage bundled an old `libwayland` that stops a newer Mesa from loading its EGL (`Could not create default EGL display: EGL_BAD_PARAMETER`). Use a newer AppImage — builds now take it from the host. |
 

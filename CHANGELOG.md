@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Only `posd` serves the API; the console binds no port and installs, starts and restarts posd as a user service. @vhidvz
+- An AppImage installs itself on first run; "Start at boot" became "Open in the tray at login" (the API runs regardless). @vhidvz
+- Updates restart the background API on the new version instead of refusing while posd runs (`posdRunning` is gone). @vhidvz
+- `--install` sets up the service, `--uninstall` removes it; a rollback to before 1.2 removes it too. @vhidvz
+- posd publishes where it serves (`serving.json`): after a failed port change the console still reaches it. @vhidvz
+
+### Fixed
+
+- posd finishes the payment in flight on SIGTERM (300 s cap) instead of dropping it; `/api/v1/health` names the process. @vhidvz
+
 ## [1.1.1] - 2026-10-17
 
 ### Fixed

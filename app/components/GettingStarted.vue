@@ -110,16 +110,10 @@ const columns = computed<{ title: string; steps: Step[] }[]>(() => {
       done: props.activity.some((a) => a.ok && a.provider !== 'sandbox'),
       to: '/guide#api',
     },
-    {
-      title: 'Keep it running',
-      text: 'Start at boot, and closing the window leaves the API serving from the tray.',
-      done: Boolean(settings.value?.app.startAtBoot),
-      to: '/settings',
-    },
   ]
   const protect: Step[] = [
     ...(install.value.available
-      ? [{ title: 'Add it to your applications menu', text: 'Installs this AppImage for your account — no password needed.', done: install.value.installed, to: '/settings' }]
+      ? [{ title: 'Install it for your account', text: 'The first run does this by itself — menu entry, icon and the background API. No password needed.', done: install.value.installed, to: '/settings' }]
       : []),
     {
       title: 'Lock the console',

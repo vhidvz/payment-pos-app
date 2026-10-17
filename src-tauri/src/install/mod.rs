@@ -63,6 +63,10 @@ impl Layout {
     pub fn icon_path(&self, size: u32) -> PathBuf {
         self.icons.join(format!("{size}x{size}/apps/{STEM}.png"))
     }
+    /// The installer's own directory; the background service keeps its marks here too.
+    pub fn state_dir(&self) -> PathBuf {
+        self.state.clone()
+    }
     pub fn journal_path(&self) -> PathBuf {
         self.state.join("install-journal.json")
     }
@@ -204,7 +208,7 @@ pub fn installed_label(installed: &Installed) -> String {
 
 /// Desktop Entry spec: an `Exec` argument containing spaces must be quoted, and
 /// a handful of characters stay special inside those quotes.
-fn quote_exec(path: &Path) -> String {
+pub(crate) fn quote_exec(path: &Path) -> String {
     format!(
         "\"{}\"",
         path.display()

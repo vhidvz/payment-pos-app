@@ -45,7 +45,7 @@ const lines = computed(() => {
   }
   const mine = boot.value?.current
   if (mine && apiVersion.value && apiVersion.value !== mine) {
-    out.push(`The API on this port is served by Ledger POS ${apiVersion.value}, not this window's ${mine} — restart it (posd, or the other copy) to finish the update.`)
+    out.push(`The background API still runs Ledger POS ${apiVersion.value} (this window is ${mine}); it is restarted onto the installed version by itself.`)
   }
   return out
 })

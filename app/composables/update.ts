@@ -13,7 +13,7 @@ export interface BootInfo {
   running: boolean
 }
 
-export type StepId = 'preflight' | 'install' | 'stopRunning' | 'launch'
+export type StepId = 'install' | 'stopRunning' | 'service' | 'launch'
 export type StepState = 'running' | 'waiting' | 'done' | 'failed'
 
 export interface Progress {
@@ -24,7 +24,6 @@ export interface Progress {
 
 export type EngineOutcome =
   | { kind: 'started'; pid: number }
-  | { kind: 'posdRunning'; pids: number[] }
   | { kind: 'runningNotStopped' }
   | { kind: 'launchFailed'; reason: string }
   | { kind: 'installFailed'; reason: string }

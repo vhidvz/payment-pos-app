@@ -214,7 +214,7 @@ function inTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
 
-async function fetchServerInfoFromShell(): Promise<{ baseUrl: string; docsUrl: string; running: boolean; error?: string } | null> {
+async function fetchServerInfoFromShell(): Promise<ShellInfo | null> {
   if (!inTauri()) return null
   try {
     const { invoke } = await import('@tauri-apps/api/core')
@@ -237,6 +237,7 @@ export const useAuthToken = () => useState<string | null>('auth-token', () => nu
 export async function resolveApiBase(): Promise<string> {
   const base = useApiBase()
   const info = await fetchServerInfoFromShell()
+  if (info) useShellInfo().value = info
   if (info?.baseUrl) base.value = info.baseUrl
   return base.value
 }
@@ -311,12 +312,21 @@ export function useApi() {
 
 // ------------------------------------------------------- shared app state
 
+/** How the background API (`posd`) runs, and what the console's last check found. */
+export interface ServiceStatus {
+  mode: 'service' | 'detached' | 'child'
+  state: 'starting' | 'serving' | 'failed'
+  version?: string
+  detail?: string
+}
+
 export interface ShellInfo {
   baseUrl: string
   docsUrl: string
   running: boolean
   version?: string
   error?: string
+  service?: ServiceStatus
 }
 
 export const useShellInfo = () => useState<ShellInfo | null>('shell-info', () => null)

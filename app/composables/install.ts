@@ -2,8 +2,9 @@
  * Desktop integration for the AppImage build.
  *
  * An AppImage is one portable file; nothing puts it on the application menu or
- * makes `posd` reachable. These commands do that under the user's own
- * directories — no privileges, and removal is exact.
+ * gives the background API (`posd`) a home that outlives the file. The first run
+ * installs it by itself, under the user's own directories — no privileges, and
+ * removal is exact. These commands are Settings' install/uninstall/rollback.
  *
  * `available` is false for packaged installs (.deb/.rpm), where the packaging
  * already did this and there is nothing to offer.
@@ -12,12 +13,13 @@ export interface InstallInfo {
   available: boolean
   installed: boolean
   installedPath?: string
-  promptDismissed: boolean
+  /** This start installed it by itself — say so once. */
+  justInstalled: boolean
   /** The version kept for one rollback, when there is one. */
   previousVersion?: string
 }
 
-const EMPTY: InstallInfo = { available: false, installed: false, promptDismissed: true }
+const EMPTY: InstallInfo = { available: false, installed: false, justInstalled: false }
 
 function inTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -34,12 +36,6 @@ async function cmd<T>(name: string): Promise<T | null> {
 }
 
 export const useInstallInfo = () => useState<InstallInfo>('install-info', () => ({ ...EMPTY }))
-
-/** The offer is made once: only from an AppImage, only while not installed. */
-export const useShowInstallWizard = () => {
-  const info = useInstallInfo()
-  return computed(() => info.value.available && !info.value.installed && !info.value.promptDismissed)
-}
 
 export function useInstall() {
   const info = useInstallInfo()
@@ -66,10 +62,5 @@ export function useInstall() {
     return version
   }
 
-  async function dismiss() {
-    await cmd<void>('dismiss_install_prompt')
-    info.value = { ...info.value, promptDismissed: true }
-  }
-
-  return { info, refresh, install, uninstall, rollback, dismiss }
+  return { info, refresh, install, uninstall, rollback }
 }

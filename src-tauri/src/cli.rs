@@ -1,7 +1,6 @@
 //! Command-line verbs, handled before any window opens (spec §7).
 
 use crate::install::{self, Layout, Source};
-use crate::update::system::{RealSystem, System};
 use crate::update::{self, engine, Boot};
 use crate::version;
 
@@ -68,13 +67,13 @@ fn refusal(layout: &Layout, allow_downgrade: bool) -> Option<String> {
     }
 }
 
-fn posd_blocks(sys: &RealSystem) -> bool {
-    let pids = sys.posd_pids();
-    if pids.is_empty() {
-        return false;
+/// The background API after an install or a rollback: one line, and whether it is up.
+fn report_service(status: Option<crate::daemon::Status>) {
+    match status.map(|s| s.describe()) {
+        None => println!("Background API: none — this version serves from its own window."),
+        Some(Ok(line)) => println!("Background API (posd): {line}"),
+        Some(Err(line)) => eprintln!("Background API (posd) did not start: {line}"),
     }
-    eprintln!("{}", engine::posd_message(&pids));
-    true
 }
 
 fn install(allow_downgrade: bool) -> i32 {
@@ -88,9 +87,6 @@ fn install(allow_downgrade: bool) -> i32 {
         eprintln!("{why}");
         return 3;
     }
-    if posd_blocks(&RealSystem::new()) {
-        return 4;
-    }
     match install::install(&layout, &source) {
         Ok(report) => {
             let user = std::env::var("USER").unwrap_or_else(|_| "this user".into());
@@ -98,9 +94,11 @@ fn install(allow_downgrade: bool) -> i32 {
             for p in report.written {
                 println!("  {}", p.display());
             }
+            // The API runs from login on, window or not — this is all a headless box needs.
+            report_service(Some(crate::daemon::real::ensure_now()));
             println!("\nLauncher: your application menu. Administrator commands: posd admin status");
             println!("If `posd` is not found, add ~/.local/bin to your PATH.");
-            println!("If Ledger POS is running, restart it to run {}.", version::VERSION);
+            println!("If the Ledger POS window is open, restart it to run {}.", version::VERSION);
             0
         }
         Err(e) => {
@@ -122,7 +120,7 @@ fn update() -> i32 {
         return 3;
     }
     let installed = install::installed(&layout);
-    let sys = RealSystem::new();
+    let sys = crate::update::system::RealSystem::new();
     let outcome = engine::run_update(&sys, &layout, &source, &installed, &engine::Timeouts::default(), &mut |p| {
         println!("[{:?}] {:?}: {}", p.step, p.state, p.message)
     });
@@ -140,12 +138,10 @@ fn update() -> i32 {
 
 fn rollback() -> i32 {
     let layout = Layout::current();
-    if posd_blocks(&RealSystem::new()) {
-        return 4;
-    }
     match install::rollback(&layout) {
         Ok(version) => {
-            println!("Rolled back to {version}. Restart Ledger POS to run it. Data files were not changed.");
+            println!("Rolled back to {version}. Restart the Ledger POS window to run it. Data files were not changed.");
+            report_service(crate::daemon::real::after_rollback(&version));
             0
         }
         Err(e) => {
@@ -156,6 +152,8 @@ fn rollback() -> i32 {
 }
 
 fn uninstall() -> i32 {
+    // Before the files: the service is named after the `posd` it runs.
+    crate::daemon::real::remove_now();
     match install::uninstall(&Layout::current()) {
         Ok(report) if report.removed.is_empty() => {
             println!("Nothing was installed.");
@@ -189,6 +187,13 @@ fn status() -> i32 {
     println!("app        : {}", layout.app_path().display());
     println!("desktop    : {}", layout.desktop_path().display());
     println!("posd       : {}", layout.posd_path().display());
+    let paths = crate::daemon::real::paths();
+    let host = crate::daemon::real::RealHost::new();
+    let api = match crate::daemon::Host::health(&host) {
+        Some(h) => format!("{} {} answers", h.process.as_deref().unwrap_or("an older Ledger POS"), h.version),
+        None => "nothing answers".into(),
+    };
+    println!("service    : {} ({}), {api}", paths.unit_name, crate::daemon::real::default_mode().label());
     0
 }
 

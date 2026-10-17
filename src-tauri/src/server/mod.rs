@@ -41,6 +41,42 @@ impl Default for ServerStatus {
     }
 }
 
+/// Where `posd` serves right now — written once it binds, so the console probes (and points
+/// its UI at) the real address, including the last-good one a failed rebind fell back to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Serving {
+    pub pid: u32,
+    pub host: String,
+    pub port: u16,
+    pub version: String,
+}
+
+/// `serving.json`, beside `settings.json`.
+pub fn serving_path() -> std::path::PathBuf {
+    crate::settings::settings_path().with_file_name("serving.json")
+}
+
+/// The published address, if the file is there and readable. Whether its `pid` still runs is
+/// the reader's question.
+pub fn read_serving(path: &std::path::Path) -> Option<Serving> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn publish(path: &std::path::Path, host: &str, port: u16) {
+    let serving = Serving {
+        pid: std::process::id(),
+        host: host.to_string(),
+        port,
+        version: crate::version::VERSION.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&serving).expect("serving serializes");
+    let meta = std::fs::metadata(path).ok();
+    if let Err(e) = crate::fsutil::atomic_write(path, &bytes, meta.as_ref(), 0o644) {
+        tracing::warn!("cannot write {} ({e}); the console probes the configured port instead", path.display());
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub settings: Arc<SettingsStore>,
@@ -58,6 +94,8 @@ pub struct AppState {
     pub admission: Arc<crate::admission::Admission>,
     pub started_at: std::time::Instant,
     pub server_status: Arc<RwLock<ServerStatus>>,
+    /// Where to publish the bound address ([`Serving`]); `None` in tests.
+    pub serving_file: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -76,6 +114,7 @@ impl AppState {
             admission: Arc::new(crate::admission::Admission::new()),
             started_at: std::time::Instant::now(),
             server_status: Arc::new(RwLock::new(ServerStatus::default())),
+            serving_file: None,
         }
     }
 
@@ -172,6 +211,10 @@ pub async fn run_server(state: AppState) {
             port: active.port,
             error: fallback_note,
         });
+        if let Some(path) = &state.serving_file {
+            let port = listener.local_addr().map(|a| a.port()).unwrap_or(active.port);
+            publish(path, &active.host, port);
+        }
 
         let app = routes::build_router(state.clone()).layer(cors_layer(&active));
 
@@ -202,5 +245,38 @@ pub async fn run_server(state: AppState) {
             port: active.port,
             error: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The console probes, and points its UI at, where posd really serves — which is the
+    /// last address that worked when a new one cannot be bound.
+    #[tokio::test]
+    async fn the_bound_address_is_published() {
+        let dir = std::env::temp_dir().join(format!("ledger-serving-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let settings = Arc::new(SettingsStore::at(dir.join("settings.json")));
+        settings.update(|s| s.server.port = port).unwrap();
+        let registry = Arc::new(ProviderRegistry::new(vec![]));
+        let auth = Arc::new(AuthState::new(dir.join("admin.json")));
+        let mut state = AppState::new(settings, registry, auth);
+        state.serving_file = Some(dir.join("serving.json"));
+        tokio::spawn(run_server(state.clone()));
+        let mut published = None;
+        for _ in 0..100 {
+            if let Some(s) = read_serving(&dir.join("serving.json")) {
+                published = Some(s);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let published = published.expect("serving.json written once bound");
+        assert_eq!((published.host.as_str(), published.port), ("127.0.0.1", port));
+        assert_eq!(published.pid, std::process::id());
+        assert_eq!(published.version, crate::version::VERSION);
     }
 }

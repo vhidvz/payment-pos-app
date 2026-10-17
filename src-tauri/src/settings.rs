@@ -151,6 +151,16 @@ pub fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
+/// The settings as they are on disk, for a process that must never write them — the
+/// console, while `posd` owns the file. Lenient: a missing, unreadable or newer file reads
+/// as what serde can make of it, else defaults; nothing is migrated, backed up or created.
+pub fn peek(path: &std::path::Path) -> Settings {
+    let Ok(raw) = std::fs::read(path) else { return Settings::default() };
+    let Ok(mut doc) = serde_json::from_slice::<Value>(&raw) else { return Settings::default() };
+    crate::migrate::strip(&mut doc);
+    serde_json::from_value(doc).unwrap_or_default()
+}
+
 pub struct SettingsStore {
     path: PathBuf,
     tx: watch::Sender<Settings>,
@@ -401,6 +411,32 @@ mod tests {
     }
 
     /// The API body has no schema key, before or after.
+    /// The console reads settings and never writes them: `posd` alone owns the file.
+    #[test]
+    fn peek_reads_without_writing() {
+        let d = dir();
+        let missing = d.join("none.json");
+        assert_eq!(peek(&missing), Settings::default());
+        assert!(!missing.exists(), "peek must not create the file");
+
+        let p = d.join("settings.json");
+        std::fs::write(&p, V0).unwrap();
+        let s = peek(&p);
+        assert_eq!(s.server.port, 4999);
+        assert!(s.app.start_at_boot);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), V0, "no migration written");
+        assert!(!d.join("settings.json.v0.bak").exists(), "no backup made");
+    }
+
+    #[test]
+    fn peek_survives_garbage() {
+        let d = dir();
+        let p = d.join("settings.json");
+        std::fs::write(&p, b"{ not json").unwrap();
+        assert_eq!(peek(&p), Settings::default());
+        assert!(p.exists() && !d.join("settings.json.invalid").exists(), "left exactly as found");
+    }
+
     #[test]
     fn the_schema_key_never_reaches_the_model() {
         let d = dir();

@@ -131,19 +131,20 @@
         <!-- ------------------------------------------------------- background -->
         <GlassCard id="background" v-show="visible.background !== false" class="guide scroll-mt-8" data-section>
           <h2>Running in the background</h2>
-          <ul>
-            <li><strong>Closing the window</strong> keeps the API serving from the system tray (<em>Minimize to tray on close</em> in <NuxtLink to="/settings">Settings</NuxtLink>). The tray icon opens the window again or quits.</li>
-            <li><strong>Start at boot</strong> launches it hidden at login; <strong>Start minimized</strong> makes every launch start in the tray.</li>
-            <li>On Linux the tray icon needs <code>libappindicator</code>; without it, closing the window leaves no way back to the app.</li>
-          </ul>
-          <h3>Without any desktop: <code>posd</code></h3>
           <p>
-            <code>posd</code> runs the same API on the same port with no window — for a server, or a till with no screen. Run it
-            or the desktop app, not both. As a systemd user service — write the unit file, then enable it:
+            The API is served by <code>posd</code>, a background process with no window, and by nothing else. This app is only
+            its console: it installs <code>posd</code> as a service, starts it, restarts it if it stops and moves it onto each new
+            version — there is nothing to set up, and nothing to choose.
           </p>
-          <CommandBox :command="SYSTEMD_UNIT" />
-          <CommandBox command="systemctl --user daemon-reload && systemctl --user enable --now posd" />
-          <p>Stop it before updating: an update refuses to run while <code>posd</code> does, and the new version runs when it is started again.</p>
+          <ul>
+            <li><strong>From login on</strong> the API answers, whether this window is open or not; on Linux it is the systemd user service <code>posd.service</code>, and it also starts at boot where the system allows it.</li>
+            <li><strong>Closing or quitting this window</strong> never stops the API. <em>Minimize to tray on close</em> and <em>Open in the tray at login</em> in <NuxtLink to="/settings">Settings</NuxtLink> are about the console only.</li>
+            <li><strong>Updates</strong> let the payment in progress finish, then restart the API on the new version by themselves.</li>
+            <li>On Linux the tray icon needs <code>libappindicator</code>; without it, closing the window leaves no way back to the console (the API keeps serving).</li>
+          </ul>
+          <h3>A machine without a desktop</h3>
+          <p>One command installs the same service, for a server or a till with no screen:</p>
+          <CommandBox command="./Ledger*.AppImage --install" />
         </GlassCard>
 
         <!-- --------------------------------------------------------- settings -->
@@ -223,10 +224,10 @@
           <h2>Installing and updating</h2>
           <h3>AppImage (any Linux)</h3>
           <p>
-            Make the file executable and open it. The first time, it offers to add itself to your applications menu — it copies
-            itself to <code>~/.local/bin/ledger-pos.AppImage</code>, adds the menu entry and icons and puts <code>posd</code> beside
-            it, all in your home folder, no password. <NuxtLink to="/settings">Settings → Desktop integration</NuxtLink> installs or
-            removes it later; removing takes back exactly those files and leaves your settings alone.
+            Make the file executable and open it. The first time, it installs itself — it copies itself to
+            <code>~/.local/bin/ledger-pos.AppImage</code>, adds the menu entry and icons, puts <code>posd</code> beside it and starts
+            the background API, all in your home folder, no password. <NuxtLink to="/settings">Settings → Desktop integration</NuxtLink>
+            removes it; removing takes back exactly those files and the service, and leaves your settings alone.
           </p>
           <p>
             <strong>To update</strong>, open the newer AppImage: it offers <em>Update and restart</em>, lets the running copy
@@ -238,7 +239,8 @@
           <h3>Packages</h3>
           <p>
             <code>.deb</code>, <code>.rpm</code> and the Windows <code>.msi</code> put the app and <code>posd</code> in place and on the
-            menu; install a newer package over the old one to update.
+            menu; the first start of the app sets up the background API. Install a newer package over the old one to update — the
+            next start of the app moves the API onto it.
           </p>
           <h3>Your data across versions</h3>
           <p>
@@ -334,26 +336,13 @@ const TROUBLE: [string, string][] = [
   ['Connection test fails but payments work', 'Some terminals ignore the test message; the app checks a second way, so a failure here is real.'],
   ['409 busy', 'One transaction at a time — wait for the previous one.'],
   ['A transaction occasionally takes ~20 s', 'The terminal sometimes ignores the opening message and the app re-sends it. Raise firstAckAttempts on the terminal\'s page if it still gives up.'],
-  ['API did not start', 'The port is taken, or the app and posd are both running. The Overview shows the reason.'],
+  ['API offline', 'Another program holds the port, or the background API is still starting. The sidebar says which; change the port in Settings if it is taken.'],
   ['Blank window right after start (Linux)', 'Older AppImages carried a graphics library that clashes with a new Mesa (“Could not create default EGL display”). Use a newer AppImage.'],
   ['Visuals stutter or look broken', 'Turn on Reduced visual effects in Settings → Appearance.'],
   ['Forgot the console password', 'Remove it on Security (needs the computer\'s administrator), or run sudo posd admin clear-password.'],
   ['The Security buttons cannot ask for a password', 'No polkit agent or pkexec on this system: the dialog shows the terminal command to run instead.'],
   ['“…can be changed without the administrator\'s password”', 'After an AppImage install, make a copy of posd only root can change, once (and after each update): sudo install -o root -g root -m 755 ~/.local/bin/posd /usr/local/bin/posd'],
 ]
-
-// A command that writes the unit, not the unit itself: `systemctl enable` below
-// fails with "Unit posd.service does not exist" until this file is in place.
-const SYSTEMD_UNIT = `mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/posd.service <<'EOF'
-[Unit]
-Description=Ledger POS REST bridge
-[Service]
-# After an AppImage install; a package install puts it in /usr/bin/posd
-ExecStart=%h/.local/bin/posd
-Restart=on-failure
-[Install]
-WantedBy=default.target
-EOF`
 
 const ADMIN_COMMANDS = `sudo posd admin status
 sudo posd admin set-password          # asks twice, shows nothing as you type

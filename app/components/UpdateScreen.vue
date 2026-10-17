@@ -50,7 +50,7 @@
             <button type="button" class="btn-ghost" @click="quit">Close</button>
           </template>
         </template>
-        <template v-else-if="outcome.kind === 'posdRunning' || outcome.kind === 'installFailed'">
+        <template v-else-if="outcome.kind === 'installFailed'">
           <button type="button" class="btn-primary flex-1" :disabled="busy" @click="start">Retry</button>
           <button type="button" class="btn-ghost" :disabled="busy" @click="quit">Close</button>
         </template>
@@ -75,11 +75,11 @@ import type { BootInfo, StepId, StepState } from '~/composables/update'
 const props = defineProps<{ boot: BootInfo }>()
 const { steps, outcome, busy, start, relaunch, rollback, openInstalled, quit } = useUpdater()
 
-const ORDER: StepId[] = ['preflight', 'install', 'stopRunning', 'launch']
+const ORDER: StepId[] = ['install', 'stopRunning', 'service', 'launch']
 const LABELS: Record<StepId, string> = {
-  preflight: 'Check that posd is not running',
   install: 'Replace the installed copy',
   stopRunning: 'Close the running copy after its sale',
+  service: 'Restart the background API on the new version',
   launch: 'Start the new version',
 }
 
@@ -120,8 +120,6 @@ const result = computed(() => {
   switch (o.kind) {
     case 'started':
       return { tone: 'text-brass-300', text: 'The new version is running. This window closes now.' }
-    case 'posdRunning':
-      return { tone: 'text-warn', text: `posd is running (pid ${o.pids.join(', ')}). Stop it — for a service, systemctl --user stop <its unit> — then retry.` }
     case 'runningNotStopped':
       return { tone: 'text-warn', text: 'The new version is installed, but the running copy did not close. It keeps running the old version until it is restarted.' }
     case 'launchFailed':

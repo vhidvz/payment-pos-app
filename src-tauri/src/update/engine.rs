@@ -1,5 +1,5 @@
-//! The update engine (spec §3.3): no running `posd` → install transaction → drain and stop
-//! the running copy → launch and verify the new one.
+//! The update engine (spec §3.3): install transaction → drain and stop the running copy →
+//! move the background service onto the new `posd` → launch and verify the new window.
 
 use std::time::Duration;
 
@@ -12,9 +12,10 @@ use crate::install::{self, Installed, Layout, Source};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StepId {
-    Preflight,
     Install,
     StopRunning,
+    /// The background API (`posd`) restarted onto the binary just installed.
+    Service,
     Launch,
 }
 
@@ -39,7 +40,6 @@ pub struct Progress {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum EngineOutcome {
     Started { pid: u32 },
-    PosdRunning { pids: Vec<u32> },
     RunningNotStopped,
     LaunchFailed { reason: String },
     InstallFailed { reason: String },
@@ -63,19 +63,10 @@ impl Default for Timeouts {
     }
 }
 
-pub fn posd_message(pids: &[u32]) -> String {
-    let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
-    format!(
-        "posd is running (pid {list}). Stop it first — for a service, `systemctl --user stop <its unit>` — \
-         then retry; started again afterwards, it runs the new version."
-    )
-}
-
 impl EngineOutcome {
     pub fn describe(&self) -> String {
         match self {
             Self::Started { pid } => format!("the new version is running (pid {pid})"),
-            Self::PosdRunning { pids } => posd_message(pids),
             Self::RunningNotStopped => "the new version is installed, but the running copy did not close; \
                 it keeps running the old version until it is restarted"
                 .into(),
@@ -97,15 +88,6 @@ pub fn run_update(
     t: &Timeouts,
     progress: &mut dyn FnMut(Progress),
 ) -> EngineOutcome {
-    // 0. No running posd: its last write must precede our first migration.
-    say(progress, StepId::Preflight, StepState::Running, "Checking that posd is not running");
-    let pids = sys.posd_pids();
-    if !pids.is_empty() {
-        say(progress, StepId::Preflight, StepState::Failed, posd_message(&pids));
-        return EngineOutcome::PosdRunning { pids };
-    }
-    say(progress, StepId::Preflight, StepState::Done, "posd is not running");
-
     // 1. The install transaction.
     say(progress, StepId::Install, StepState::Running, "Replacing the installed copy");
     if let Err(reason) = install::install(layout, source) {
@@ -142,7 +124,15 @@ pub fn run_update(
         say(progress, StepId::StopRunning, StepState::Done, "The running copy closed");
     }
 
-    // 3. Launch and verify.
+    // 3. The background API: `posd` drains, then starts again as the version just installed.
+    // A failure here is not the update's: the new window keeps trying.
+    say(progress, StepId::Service, StepState::Running, "Restarting the background API on the new version");
+    match sys.ensure_daemon() {
+        Ok(state) => say(progress, StepId::Service, StepState::Done, format!("Background API: {state}")),
+        Err(why) => say(progress, StepId::Service, StepState::Failed, format!("{why} — the new version retries it")),
+    }
+
+    // 4. Launch and verify.
     relaunch(sys, layout, t, progress)
 }
 
@@ -196,7 +186,8 @@ mod tests {
     }
     struct St {
         clock: Duration,
-        posd: Vec<u32>,
+        daemon_ensures: u32,
+        daemon_fails: Option<String>,
         old_running: bool,
         /// After a quit request, the old copy exits this much later (`None`: never — legacy).
         old_quits_after: Option<Duration>,
@@ -215,7 +206,8 @@ mod tests {
                 base: Instant::now(),
                 s: Mutex::new(St {
                     clock: Duration::ZERO,
-                    posd: vec![],
+                    daemon_ensures: 0,
+                    daemon_fails: None,
                     old_running: false,
                     old_quits_after: Some(Duration::from_secs(2)),
                     quit_at: None,
@@ -234,8 +226,13 @@ mod tests {
     }
 
     impl System for Fake {
-        fn posd_pids(&self) -> Vec<u32> {
-            self.s.lock().unwrap().posd.clone()
+        fn ensure_daemon(&self) -> Result<String, String> {
+            let mut s = self.s.lock().unwrap();
+            s.daemon_ensures += 1;
+            match &s.daemon_fails {
+                Some(why) => Err(why.clone()),
+                None => Ok("serving 9.9.9".into()),
+            }
         }
         fn instance_pid(&self) -> Option<u32> {
             let s = self.s.lock().unwrap();
@@ -283,13 +280,26 @@ mod tests {
         (out, seen)
     }
 
+    /// The service moves onto the new `posd` only once the old copy has let go of everything
+    /// — and before the new window starts, so the window finds its API already answering.
     #[test]
-    fn a_running_posd_stops_the_update_before_anything_changes() {
+    fn the_service_is_restarted_after_the_old_copy_stops() {
         let r = root();
-        let sys = Fake::new(layout(&r).app_path()).with(|s| s.posd = vec![4242]);
-        let (out, _) = go(&sys, &r, &Installed::None);
-        assert_eq!(out, EngineOutcome::PosdRunning { pids: vec![4242] });
-        assert!(!layout(&r).app_path().exists(), "nothing was installed");
+        let sys = Fake::new(layout(&r).app_path()).with(|s| s.old_running = true);
+        let (out, seen) = go(&sys, &r, &Installed::Version(semver::Version::new(1, 1, 1)));
+        assert_eq!(out, EngineOutcome::Started { pid: NEW });
+        let order: Vec<StepId> = seen.iter().filter(|p| p.state == StepState::Done).map(|p| p.step).collect();
+        assert_eq!(order, vec![StepId::Install, StepId::StopRunning, StepId::Service, StepId::Launch]);
+        assert_eq!(sys.s.lock().unwrap().daemon_ensures, 1);
+    }
+
+    #[test]
+    fn a_service_failure_does_not_abort_the_update() {
+        let r = root();
+        let sys = Fake::new(layout(&r).app_path()).with(|s| s.daemon_fails = Some("no systemd".into()));
+        let (out, seen) = go(&sys, &r, &Installed::None);
+        assert_eq!(out, EngineOutcome::Started { pid: NEW }, "the new window retries the service");
+        assert!(seen.iter().any(|p| p.step == StepId::Service && p.state == StepState::Failed && p.message.contains("no systemd")));
     }
 
     #[test]

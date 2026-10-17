@@ -72,6 +72,7 @@
               {{ serverUp ? 'API serving' : 'API offline' }}
             </div>
             <div class="truncate font-mono text-[0.6875rem] text-paper-mute tabular">{{ baseHost }}</div>
+            <div v-if="!serverUp && serviceNote" class="mt-1 text-[0.6875rem] leading-snug text-paper-mute">{{ serviceNote }}</div>
           </div>
         </div>
       </div>
@@ -87,7 +88,6 @@
       </div>
     </main>
 
-    <InstallWizard />
     <UnlockDialog />
     <AdminDialog />
 
@@ -118,6 +118,14 @@ const base = useApiBase()
 
 const serverUp = ref(false)
 const baseHost = computed(() => base.value.replace(/^https?:\/\//, ''))
+// Why the background API is not answering yet, as the console's supervisor last saw it.
+const shellInfo = useShellInfo()
+const serviceNote = computed(() => {
+  const s = shellInfo.value?.service
+  if (!s) return ''
+  if (s.state === 'starting') return s.detail ? `Starting the background API — ${s.detail}` : 'Starting the background API…'
+  return s.detail ?? ''
+})
 
 
 const nav = [
@@ -162,7 +170,7 @@ function isActive(to: string) {
 
 const auth = useAuth()
 const locked = useLocked()
-const { refresh: refreshInstall } = useInstall()
+const { info: installInfo, refresh: refreshInstall } = useInstall()
 
 async function lockNow() {
   await auth.lock()
@@ -201,15 +209,17 @@ async function poll() {
     await auth.refresh()
   } catch {
     serverUp.value = false
-    // The shell may have rebound to a new port — re-resolve.
+    // The port may have changed, and the shell says what the service is doing — re-resolve.
     await resolveApiBase()
   }
 }
 
 onMounted(() => {
   poll()
-  // Asked once per machine: only from an AppImage, only while not yet installed.
-  refreshInstall()
+  // The first run of an AppImage installs it by itself; say so once.
+  refreshInstall().then(() => {
+    if (installInfo.value.justInstalled) toast('ok', 'Ledger POS is installed — the API now runs in the background, from login on')
+  })
   timer = setInterval(poll, 5000)
   idleTimer = setInterval(checkIdle, 15_000)
   ACTIVITY_EVENTS.forEach((e) => window.addEventListener(e, noteActivity, { passive: true }))

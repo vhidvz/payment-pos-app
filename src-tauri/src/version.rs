@@ -16,7 +16,12 @@ pub fn set_process(name: &'static str) {
 }
 
 pub fn is_app() -> bool {
-    PROCESS.get().copied().unwrap_or("app") == "app"
+    process_name() == "app"
+}
+
+/// `posd` or `app` — `/api/v1/health` reports it, so a prober knows who answers.
+pub fn process_name() -> &'static str {
+    PROCESS.get().copied().unwrap_or("app")
 }
 
 /// Who did something, for `state.json`'s `migrations[].by`: `app 1.0.0`, `posd 1.0.0`.

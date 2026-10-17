@@ -59,16 +59,16 @@
           <div class="flex items-center justify-between gap-6">
             <div>
               <div class="text-sm text-paper">Minimize to tray on close</div>
-              <p class="text-xs text-paper-mute">Closing the window keeps the API serving from the system tray.</p>
+              <p class="text-xs text-paper-mute">Closing the window keeps the console in the system tray. The API runs in the background either way.</p>
             </div>
             <TSwitch v-model="model.app.minimizeToTrayOnClose" label="Minimize to tray on close" />
           </div>
           <div class="flex items-center justify-between gap-6">
             <div>
-              <div class="text-sm text-paper">Start at boot</div>
-              <p class="text-xs text-paper-mute">Registers with the OS autostart; launches quietly with <code class="font-mono">--background</code>.</p>
+              <div class="text-sm text-paper">Open in the tray at login</div>
+              <p class="text-xs text-paper-mute">Brings the console back to the tray when you log in. The API does not need it — it already starts at login.</p>
             </div>
-            <TSwitch v-model="model.app.startAtBoot" label="Start at boot" />
+            <TSwitch v-model="model.app.startAtBoot" label="Open in the tray at login" />
           </div>
           <div class="flex items-center justify-between gap-6">
             <div>
@@ -79,8 +79,9 @@
           </div>
         </div>
         <p class="mt-5 text-[0.6875rem] leading-relaxed text-paper-mute">
-          No desktop at all, or a server? The same API runs without a window as <code class="font-mono">posd</code> —
-          <NuxtLink to="/guide#background" class="text-brass-400 hover:text-brass-300">how to run it as a service</NuxtLink>.
+          The API is served by <code class="font-mono">posd</code>, a background service this app installs and keeps
+          running — closing or quitting this window never stops it.
+          <NuxtLink to="/guide#background" class="text-brass-400 hover:text-brass-300">How it runs</NuxtLink>.
         </p>
       </GlassCard>
 
@@ -115,9 +116,9 @@
       <GlassCard v-if="installInfo.available" data-reveal>
         <h2 class="display mb-1 text-xl text-paper">Desktop integration</h2>
         <p class="mb-5 text-xs leading-relaxed text-paper-mute">
-          You are running the portable file. Installing adds it to your applications menu and makes
-          the <code class="font-mono">posd</code> command available — all in your home directory,
-          no password needed.
+          The portable file installs itself on its first run: the applications menu, the
+          <code class="font-mono">posd</code> command and the background API — all in your home directory,
+          no password needed. Uninstalling removes them; the API then stops when this window closes.
         </p>
 
         <div class="flex flex-wrap items-center justify-between gap-4">

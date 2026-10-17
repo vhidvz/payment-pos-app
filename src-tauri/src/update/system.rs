@@ -13,8 +13,9 @@ pub const INTERFACE: &str = "org.SingleInstance.DBus";
 pub const QUIT_FOR_UPDATE: &str = "--quit-for-update";
 
 pub trait System: Send + Sync {
-    /// This user's running `posd` processes.
-    fn posd_pids(&self) -> Vec<u32>;
+    /// Reconcile the background API onto the installed `posd` ([`crate::daemon`]):
+    /// `Ok(what it found)`, or why it could not.
+    fn ensure_daemon(&self) -> Result<String, String>;
     /// The process that owns the single-instance name, if any.
     fn instance_pid(&self) -> Option<u32>;
     fn request_quit(&self) -> Result<(), String>;
@@ -30,6 +31,11 @@ pub trait System: Send + Sync {
 /// `/proc/<pid>` entries owned by `uid` whose binary is named `posd` — a binary replaced
 /// on disk reads `posd (deleted)` and still counts.
 pub fn scan_posd(proc_root: &Path, uid: u32) -> Vec<u32> {
+    scan_posd_exe(proc_root, uid).into_iter().map(|(pid, _)| pid).collect()
+}
+
+/// [`scan_posd`] with the binary each one runs, as `/proc/<pid>/exe` reads.
+pub fn scan_posd_exe(proc_root: &Path, uid: u32) -> Vec<(u32, PathBuf)> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(proc_root).into_iter().flatten().flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
@@ -46,7 +52,7 @@ pub fn scan_posd(proc_root: &Path, uid: u32) -> Vec<u32> {
         let Ok(exe) = std::fs::read_link(dir.join("exe")) else { continue };
         let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if name == "posd" || name == "posd (deleted)" {
-            out.push(pid);
+            out.push((pid, exe));
         }
     }
     out.sort_unstable();
@@ -117,9 +123,8 @@ mod dbus {
 
 #[cfg(target_os = "linux")]
 impl System for RealSystem {
-    fn posd_pids(&self) -> Vec<u32> {
-        // SAFETY: getuid cannot fail and has no preconditions.
-        scan_posd(Path::new("/proc"), unsafe { libc::getuid() })
+    fn ensure_daemon(&self) -> Result<String, String> {
+        crate::daemon::real::ensure_now().describe()
     }
     fn instance_pid(&self) -> Option<u32> {
         dbus::owner_pid().unwrap_or_else(|e| {
@@ -175,8 +180,8 @@ impl System for RealSystem {
 /// The AppImage update path is Linux-only; elsewhere the engine is never reached.
 #[cfg(not(target_os = "linux"))]
 impl System for RealSystem {
-    fn posd_pids(&self) -> Vec<u32> {
-        Vec::new()
+    fn ensure_daemon(&self) -> Result<String, String> {
+        crate::daemon::real::ensure_now().describe()
     }
     fn instance_pid(&self) -> Option<u32> {
         None
@@ -230,6 +235,13 @@ mod tests {
         fake(104, 1000, "/usr/bin/payment-pos-app");
         std::fs::create_dir_all(root.join("self")).unwrap();
         assert_eq!(scan_posd(&root, 1000), vec![101, 102]);
+        assert_eq!(
+            scan_posd_exe(&root, 1000),
+            vec![
+                (101, PathBuf::from("/home/u/.local/bin/posd")),
+                (102, PathBuf::from("/home/u/.local/bin/posd (deleted)")),
+            ]
+        );
     }
 
     #[test]

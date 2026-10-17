@@ -360,14 +360,16 @@ async fn main() {
 
     // Webhook events: idle unless an administrator configured a subscription.
     tokio::spawn(payment_pos_app_lib::events::run(state.clone()));
+    // The server keeps answering while we drain, so a stop never cuts a payment off mid-way.
+    tokio::spawn(payment_pos_app_lib::server::run_server(state.clone()));
 
-    tokio::select! {
-        _ = payment_pos_app_lib::server::run_server(state.clone()) => {}
-        _ = stop_signal() => {
-            eprintln!("\nposd: shutting down");
-            payment_pos_app_lib::events::shutdown(&state, std::time::Duration::from_secs(3)).await;
-        }
+    stop_signal().await;
+    eprintln!("\nposd: finishing the requests in flight, then shutting down");
+    // The service unit gives a stop 330 s (`daemon::render_unit`) — more than this cap.
+    if !state.admission.drain(std::time::Duration::from_secs(300)).await {
+        eprintln!("posd: drain cap reached; exiting with requests still in flight");
     }
+    payment_pos_app_lib::events::shutdown(&state, std::time::Duration::from_secs(3)).await;
 }
 
 /// Ctrl-C, or — the way systemd stops a service — SIGTERM. Either one sends
