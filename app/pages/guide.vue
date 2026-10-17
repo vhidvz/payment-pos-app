@@ -139,7 +139,7 @@
           <h3>Without any desktop: <code>posd</code></h3>
           <p>
             <code>posd</code> runs the same API on the same port with no window — for a server, or a till with no screen. Run it
-            or the desktop app, not both. As a systemd user service:
+            or the desktop app, not both. As a systemd user service — write the unit file, then enable it:
           </p>
           <CommandBox :command="SYSTEMD_UNIT" />
           <CommandBox command="systemctl --user daemon-reload && systemctl --user enable --now posd" />
@@ -342,7 +342,9 @@ const TROUBLE: [string, string][] = [
   ['“…can be changed without the administrator\'s password”', 'After an AppImage install, make a copy of posd only root can change, once (and after each update): sudo install -o root -g root -m 755 ~/.local/bin/posd /usr/local/bin/posd'],
 ]
 
-const SYSTEMD_UNIT = `# ~/.config/systemd/user/posd.service
+// A command that writes the unit, not the unit itself: `systemctl enable` below
+// fails with "Unit posd.service does not exist" until this file is in place.
+const SYSTEMD_UNIT = `mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/posd.service <<'EOF'
 [Unit]
 Description=Ledger POS REST bridge
 [Service]
@@ -350,7 +352,8 @@ Description=Ledger POS REST bridge
 ExecStart=%h/.local/bin/posd
 Restart=on-failure
 [Install]
-WantedBy=default.target`
+WantedBy=default.target
+EOF`
 
 const ADMIN_COMMANDS = `sudo posd admin status
 sudo posd admin set-password          # asks twice, shows nothing as you type

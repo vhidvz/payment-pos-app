@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Guide: the posd systemd box is now a command that writes the unit; `enable` no longer fails "does not exist". @vhidvz
+
 ## [1.1.0] - 2026-10-16
 
 ### Added
