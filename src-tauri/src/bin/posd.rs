@@ -365,9 +365,18 @@ async fn main() {
 
     stop_signal().await;
     eprintln!("\nposd: finishing the requests in flight, then shutting down");
-    // The service unit gives a stop 330 s (`daemon::render_unit`) — more than this cap.
-    if !state.admission.drain(std::time::Duration::from_secs(300)).await {
-        eprintln!("posd: drain cap reached; exiting with requests still in flight");
+    // The service unit gives a stop 330 s (`daemon::render_unit`) — more than this cap. A
+    // second Ctrl-C (or SIGTERM) is someone at a terminal who means it: stop now.
+    tokio::select! {
+        drained = state.admission.drain(std::time::Duration::from_secs(300)) => {
+            if !drained {
+                eprintln!("posd: drain cap reached; exiting with requests still in flight");
+            }
+        }
+        _ = stop_signal() => {
+            eprintln!("posd: stopping now, without waiting for the requests in flight");
+            return;
+        }
     }
     payment_pos_app_lib::events::shutdown(&state, std::time::Duration::from_secs(3)).await;
 }

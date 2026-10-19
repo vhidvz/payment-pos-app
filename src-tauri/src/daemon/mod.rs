@@ -296,8 +296,9 @@ fn ensure_service(
     let dir = host.manager_unit_dir().ok_or("no systemd user manager")?;
     let unit = paths.unit_name.as_str();
     let unit_path = dir.join(unit);
-    let body = render_unit(&target.exe, &paths.env);
-    let changed = host.read(&unit_path).as_deref() != Some(body.as_str());
+    let existing = host.read(&unit_path);
+    let body = render_unit(&target.exe, &unit_env(&paths.env, existing.as_deref()));
+    let changed = existing.as_deref() != Some(body.as_str());
     if changed {
         host.write(&unit_path, &body)?;
         host.systemctl(&["daemon-reload"])?;
@@ -362,11 +363,12 @@ fn ensure_spawned(
         return status(mode, "serving", health.map(|h| h.version), None);
     }
     let procs = host.posd_processes();
-    if health.is_some() {
-        // A wrong `posd` answers (or an older window does): replace every posd we can.
+    if matches!(&health, Some(h) if h.process.as_deref() == Some("posd")) {
+        // A posd of the wrong version answers: replace every posd we can.
         retire(host, &procs.iter().map(|(p, _)| *p).collect::<Vec<_>>(), t);
     } else if procs.iter().any(|(_, running)| same_binary(running, exe)) {
-        // Ours is up but not answering — still starting, or waiting for the port.
+        // Ours is up but not answering — still starting, or waiting for a port another
+        // program (or an older window) holds; killing posd would free nothing.
         return status(mode, "starting", None, Some(describe(&health)));
     }
     let pid = match host.spawn(exe, detached) {
@@ -376,6 +378,57 @@ fn ensure_spawned(
     let mut s = wait_healthy(host, mode, expected, t);
     s.spawned = Some(pid);
     s
+}
+
+/// How the service is installed now, whatever this build would choose: a unit we wrote,
+/// a login entry for a detached posd, or nothing.
+pub fn mode_in_use(host: &dyn Host, paths: &Paths) -> Option<Mode> {
+    if let Some(dir) = host.manager_unit_dir() {
+        if host.read(&dir.join(&paths.unit_name)).is_some_and(|b| b.starts_with(MARKER)) {
+            return Some(Mode::Service);
+        }
+    }
+    paths.autostart.as_ref().filter(|a| host.read(a).is_some()).map(|_| Mode::Detached)
+}
+
+/// Network settings a process may lack — a console started from the menu, without the
+/// terminal's proxy — that must not be stripped from the unit (webhooks need them) nor
+/// rewrite it and restart posd: a process that has one sets it; one without leaves it.
+const STICKY: [&str; 6] = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
+
+/// The `Environment=` pairs of a unit we rendered.
+fn parse_unit_env(unit: &str) -> Vec<(String, String)> {
+    unit.lines()
+        .filter_map(|l| l.strip_prefix("Environment=\"")?.strip_suffix('"'))
+        .filter_map(|quoted| {
+            let mut out = String::new();
+            let mut chars = quoted.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => out.extend(chars.next()),
+                    '%' => {
+                        out.push('%');
+                        chars.next(); // `%%` is one literal `%`
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// The unit's environment: this process's, plus sticky settings the unit already carries.
+/// Sorted, so the same settings always render the same file.
+fn unit_env(current: &[(String, String)], existing: Option<&str>) -> Vec<(String, String)> {
+    let mut env = current.to_vec();
+    for (k, v) in existing.map(parse_unit_env).unwrap_or_default() {
+        if STICKY.contains(&k.as_str()) && !env.iter().any(|(have, _)| *have == k) {
+            env.push((k, v));
+        }
+    }
+    env.sort();
+    env
 }
 
 /// Turn linger on once, remembering that we did.
@@ -405,6 +458,7 @@ pub fn remove(host: &dyn Host, paths: &Paths, exe: &Path) {
     if let Some(entry) = &paths.autostart {
         host.remove(entry);
     }
+    host.remove(&paths.state_dir.join("posd.log"));
     let mark = paths.state_dir.join(LINGER_MARK);
     if host.read(&mark).is_some() {
         host.disable_linger();
@@ -794,6 +848,54 @@ mod tests {
         });
         remove(&foreign, &paths(), Path::new(EXE));
         assert!(foreign.st().files.contains_key(&Fake::unit_path()), "a unit we did not write stays");
+    }
+
+    /// A console started from the menu lacks the proxy a terminal had: it must not strip it
+    /// (webhooks need it) nor rewrite the unit and restart posd over it.
+    #[test]
+    fn proxy_settings_survive_a_reconcile_without_them() {
+        let host = Fake::new();
+        let with = Paths { env: vec![("HTTPS_PROXY".into(), "http://p:8080".into())], ..paths() };
+        ensure(&host, &with, &target(Mode::Service), &Timeouts::default());
+        host.st().calls.clear();
+        ensure(&host, &paths(), &target(Mode::Service), &Timeouts::default());
+        let s = host.st();
+        assert!(s.files[&Fake::unit_path()].contains("Environment=\"HTTPS_PROXY=http://p:8080\""));
+        assert_eq!(s.calls, vec!["enable posd.service", "start posd.service"], "no rewrite, no restart");
+    }
+
+    #[test]
+    fn a_stranger_on_the_port_is_not_fought_in_detached_mode() {
+        let stranger = Some(Health { version: String::new(), process: Some("another program".into()) });
+        let host = Fake::new().with(|s| {
+            s.serving = stranger.clone();
+            s.starts = false;
+            s.procs = vec![(12, PathBuf::from("/tmp/dev/posd"))];
+        });
+        assert_eq!(go(&host, Mode::Detached).state, "starting");
+        assert_eq!(go(&host, Mode::Detached).state, "starting");
+        let s = host.st();
+        assert_eq!(s.spawned.len(), 1, "one copy waits for the port; no respawn per tick");
+        assert!(s.terminated.is_empty(), "killing posd frees nothing another program holds");
+    }
+
+    #[test]
+    fn remove_clears_the_daemon_log() {
+        let host = Fake::new().with(|s| {
+            s.files.insert(paths().state_dir.join("posd.log"), "old".into());
+        });
+        remove(&host, &paths(), Path::new(EXE));
+        assert!(!host.st().files.contains_key(&paths().state_dir.join("posd.log")));
+    }
+
+    #[test]
+    fn the_mode_in_use_is_what_is_installed() {
+        let host = Fake::new();
+        assert_eq!(mode_in_use(&host, &paths()), None);
+        go(&host, Mode::Detached);
+        assert_eq!(mode_in_use(&host, &paths()), Some(Mode::Detached));
+        go(&host, Mode::Service);
+        assert_eq!(mode_in_use(&host, &paths()), Some(Mode::Service));
     }
 
     #[test]

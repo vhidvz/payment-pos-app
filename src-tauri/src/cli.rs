@@ -193,7 +193,8 @@ fn status() -> i32 {
         Some(h) => format!("{} {} answers", h.process.as_deref().unwrap_or("an older Ledger POS"), h.version),
         None => "nothing answers".into(),
     };
-    println!("service    : {} ({}), {api}", paths.unit_name, crate::daemon::real::default_mode().label());
+    let mode = crate::daemon::mode_in_use(&host, &paths).map_or("not set up", |m| m.label());
+    println!("service    : {} ({mode}), {api}", paths.unit_name);
     0
 }
 

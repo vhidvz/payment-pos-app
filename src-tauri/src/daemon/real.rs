@@ -95,6 +95,19 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// The detached/child posd's log: appended, so a respawn keeps what went before; started
+/// over past 1 MiB, so it never grows without bound.
+pub fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let big = std::fs::metadata(path).is_ok_and(|m| m.len() > 1024 * 1024);
+    let mut options = std::fs::OpenOptions::new();
+    if big {
+        options.write(true).create(true).truncate(true);
+    } else {
+        options.append(true).create(true);
+    }
+    options.open(path)
+}
+
 /// The real machine. Keeps the children it starts, so a child-mode `posd` is reaped.
 pub struct RealHost {
     children: Mutex<HashMap<u32, Child>>,
@@ -178,7 +191,14 @@ impl Host for RealHost {
     }
 
     fn binary_version(&self, exe: &Path) -> Option<String> {
-        let out = Command::new(exe).arg("--version").stdin(Stdio::null()).output().ok()?;
+        // The environment posd itself gets: not our AppImage's, whose libraries may not suit it.
+        let out = Command::new(exe)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .env_clear()
+            .envs(crate::update::system::clean_env(std::env::vars(), std::env::var("APPDIR").ok().as_deref()))
+            .output()
+            .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         text.trim().strip_prefix("posd ").map(str::to_string)
     }
@@ -200,7 +220,8 @@ impl Host for RealHost {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
         #[cfg(not(unix))]
-        let _ = Command::new("taskkill").args(["/PID", &pid.to_string()]).output();
+        // A windowless process has no console to signal: Windows can only end it outright.
+        let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
     }
 
     fn alive(&self, pid: u32) -> bool {
@@ -215,7 +236,7 @@ impl Host for RealHost {
         if let Some(dir) = self.log.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let log = std::fs::File::create(&self.log).ok();
+        let log = open_log(&self.log).ok();
         let mut cmd = Command::new(exe);
         cmd.stdin(Stdio::null())
             .stdout(log.as_ref().and_then(|f| f.try_clone().ok()).map_or(Stdio::null(), Stdio::from))
@@ -426,6 +447,19 @@ mod tests {
         assert!(!pid_alive(pid), "a zombie holds no port and serves nothing");
         drop(child);
         assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn the_log_is_appended_and_kept_small() {
+        let dir = std::env::temp_dir().join(format!("ledger-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("posd.log");
+        std::fs::write(&log, "first run\n").unwrap();
+        { use std::io::Write as _; open_log(&log).unwrap().write_all(b"second run\n").unwrap(); }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "first run\nsecond run\n", "a respawn keeps the evidence");
+        std::fs::write(&log, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        drop(open_log(&log).unwrap());
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0, "past 1 MiB it starts over");
     }
 
     #[test]

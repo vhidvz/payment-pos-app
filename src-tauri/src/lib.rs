@@ -94,7 +94,7 @@ struct Shell {
     run_state: Arc<runstate::StateStore>,
     daemon: Arc<daemon::supervisor::Supervisor>,
     /// This start installed the AppImage by itself; the frontend says so once.
-    just_installed: bool,
+    just_installed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn current_settings() -> settings::Settings {
@@ -144,7 +144,7 @@ fn install_info(shell: &Shell) -> InstallInfo {
         installed: install::is_installed(&layout),
         installed_path: install::is_installed(&layout)
             .then(|| layout.app_path().display().to_string()),
-        just_installed: shell.just_installed,
+        just_installed: shell.just_installed.load(std::sync::atomic::Ordering::SeqCst),
         previous_version: install::txn::previous_version(&layout),
     }
 }
@@ -554,14 +554,13 @@ fn run_update_mode(boot: update::Boot, layout: install::Layout) {
 }
 
 fn run_normal(background: bool) {
-    let just_installed = auto_install();
     let run_state = Arc::new(runstate::StateStore::open(runstate::state_path()));
     run_state.note_app_start(version::VERSION);
     let shell = Shell {
         admission: Arc::new(admission::Admission::new()),
         run_state,
         daemon: daemon::supervisor::Supervisor::new(),
-        just_installed,
+        just_installed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let daemon = shell.daemon.clone();
 
@@ -604,6 +603,11 @@ fn run_normal(background: bool) {
             ack_version_notice
         ])
         .setup(move |app| {
+            // Only now: a launch the single-instance plugin hands to a copy already running
+            // never got here, so it installs nothing behind that copy's back.
+            if auto_install() {
+                shell.just_installed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             // The API: `posd`, installed and kept answering. The console binds nothing.
             shell.daemon.start();
 

@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - posd finishes the payment in flight on SIGTERM (300 s cap) instead of dropping it; `/api/v1/health` names the process. @vhidvz
+- A proxy set for posd survives a console started without it; a stranger on the port no longer causes respawns. @vhidvz
+- Auto-install runs only in the copy that keeps running; a second Ctrl-C stops posd without waiting. @vhidvz
+- The detached posd log is appended (reset past 1 MiB) and removed on uninstall; `--install-status` shows the mode in use. @vhidvz
 
 ## [1.1.1] - 2026-10-17
 

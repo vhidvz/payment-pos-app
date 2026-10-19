@@ -346,7 +346,7 @@ because the posture travels with every sale.
 | Connection test fails but payments work | Some terminals ignore the test message; the app checks a second way, so a failure here is real. |
 | `409 busy` | One transaction at a time — wait for the previous one. |
 | A transaction occasionally takes ~20s | The terminal sometimes ignores the opening message; the app re-sends it automatically. Raise **firstAckAttempts** on the provider page if it still gives up. |
-| API offline | Another program holds the port, or `posd` is still starting — the console's sidebar says which. `systemctl --user status posd` shows the service. |
+| API offline | Another program holds the port, or `posd` is still starting — the console's sidebar says which; if the port is taken, change it in Settings. |
 | Forgot the password | *Security → Remove password*, or `sudo posd admin clear-password` on the machine. |
 | Blank window right after start (Linux AppImage 1.0.0) | That AppImage bundled an old `libwayland` that stops a newer Mesa from loading its EGL (`Could not create default EGL display: EGL_BAD_PARAMETER`). Use a newer AppImage — builds now take it from the host. |
 
