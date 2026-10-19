@@ -1,6 +1,6 @@
 [package]
 name = "payment-pos-app"
-version = "1.1.1"
+version = "1.2.0"
 description = "Ledger POS — a desktop bridge that exposes payment POS terminals as a local REST API"
 authors = ["Vahid V. <vhid.vz@gmail.com>"]
 edition = "2021"
