@@ -27,15 +27,16 @@ pub const APP_DIR_NAME: &str = "ledger-pos";
 fn d_host() -> String { "127.0.0.1".into() }
 fn d_port() -> u16 { DEFAULT_PORT }
 fn d_true() -> bool { true }
+/// The console's own webview origins (Linux/macOS use tauri://, Windows http://tauri.localhost).
+/// `posd` answers them whatever `corsAllowedOrigins` says — the console reaches the API
+/// from them, so a list narrowed to one shop site would otherwise cut the console off.
+pub const CONSOLE_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
+
 fn d_cors_origins() -> Vec<String> {
-    vec![
-        // Tauri webview origins (Linux/Windows use tauri://, Windows also http://tauri.localhost)
-        "tauri://localhost".into(),
-        "http://tauri.localhost".into(),
-        // Nuxt dev server
-        "http://localhost:14373".into(),
-        "http://127.0.0.1:14373".into(),
-    ]
+    let mut origins: Vec<String> = CONSOLE_ORIGINS.iter().map(|o| (*o).into()).collect();
+    // Nuxt dev server
+    origins.extend(["http://localhost:14373".into(), "http://127.0.0.1:14373".into()]);
+    origins
 }
 fn d_active_provider() -> String { "sandbox".into() }
 

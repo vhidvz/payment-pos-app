@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `posd` always answers the console's own origins, so a narrowed corsAllowedOrigins no longer shows "API offline". @vhidvz
+
 ## [1.2.0] - 2026-10-19
 
 ### Changed

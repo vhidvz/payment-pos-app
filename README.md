@@ -301,7 +301,10 @@ an existing library. The body is `{ "type", "timestamp", "data" }`:
 Every event carries `data.device`: the installation's id and its **posture** —
 whether a password is set, whether the console is unlocked right now, and
 `securityDigest`, a fingerprint of the settings a payment depends on (API
-address, CORS, the active terminal and its configuration). A receiver that
+address, CORS, the active terminal and its configuration). The CORS part is the
+saved `corsAllowedOrigins` list; the console's own origins (`tauri://localhost`,
+`http://tauri.localhost`) are always allowed on top of it and are not part of
+the fingerprint. A receiver that
 recorded the fingerprint can tell from *any* later message that the machine is
 no longer set up the way it accepted — including a `settings.json` edited by
 hand while the app was off, which only shows as a new fingerprint in

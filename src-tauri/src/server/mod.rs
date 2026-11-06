@@ -134,9 +134,13 @@ fn cors_layer(server: &ServerSettings) -> CorsLayer {
     if server.cors_allow_all {
         layer.allow_origin(Any)
     } else {
-        let origins: Vec<HeaderValue> = server
-            .cors_allowed_origins
+        // The console's own origins are always answered (`CONSOLE_ORIGINS`), but never
+        // written into the list: the security digest hashes the list as saved, so a
+        // receiver that recorded it sees no change from this.
+        let origins: Vec<HeaderValue> = crate::settings::CONSOLE_ORIGINS
             .iter()
+            .copied()
+            .chain(server.cors_allowed_origins.iter().map(String::as_str))
             .filter_map(|o| o.parse().ok())
             .collect();
         layer.allow_origin(AllowOrigin::list(origins))
@@ -278,5 +282,53 @@ mod tests {
         assert_eq!((published.host.as_str(), published.port), ("127.0.0.1", port));
         assert_eq!(published.pid, std::process::id());
         assert_eq!(published.version, crate::version::VERSION);
+    }
+
+    /// What `Access-Control-Allow-Origin` the layer answers for `origin`, if any.
+    async fn allowed(server: &ServerSettings, origin: &str) -> Option<String> {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+        let app = Router::new().route("/", get(|| async { "ok" })).layer(cors_layer(server));
+        let res = app
+            .oneshot(Request::builder().uri("/").header("origin", origin).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        res.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_owned())
+    }
+
+    /// The console reaches posd from its own webview, so a list narrowed to one shop
+    /// site must not cut the console off ("API offline" with posd healthy) — while
+    /// every other origin stays exactly as the list says.
+    #[tokio::test]
+    async fn the_console_is_always_allowed() {
+        let server = ServerSettings {
+            cors_allowed_origins: vec!["http://localhost:3105".into()],
+            cors_allow_all: false,
+            ..ServerSettings::default()
+        };
+        for origin in crate::settings::CONSOLE_ORIGINS {
+            assert_eq!(allowed(&server, origin).await.as_deref(), Some(origin), "{origin}");
+        }
+        assert_eq!(allowed(&server, "http://localhost:3105").await.as_deref(), Some("http://localhost:3105"));
+        assert_eq!(allowed(&server, "http://evil.example").await, None);
+
+        // The console's writes go through a preflight first.
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+        for (origin, expected) in [("tauri://localhost", Some("tauri://localhost")), ("http://evil.example", None)] {
+            let app = Router::new().route("/", get(|| async { "ok" })).layer(cors_layer(&server));
+            let req = Request::builder()
+                .method("OPTIONS")
+                .uri("/")
+                .header("origin", origin)
+                .header("access-control-request-method", "PUT")
+                .body(Body::empty())
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let got = res.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap());
+            assert_eq!(got, expected, "preflight from {origin}");
+        }
     }
 }

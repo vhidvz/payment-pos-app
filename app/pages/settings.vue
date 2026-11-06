@@ -40,7 +40,7 @@
           <div class="space-y-1 sm:col-span-2">
             <label for="srv-cors" class="font-mono text-[0.8125rem] text-paper">corsAllowedOrigins</label>
             <textarea id="srv-cors" v-model="corsText" rows="3" class="field font-mono text-[0.8125rem]" spellcheck="false" />
-            <p class="text-xs text-paper-mute">One browser origin per line. Only affects browsers — curl/scripts are never blocked by CORS.</p>
+            <p class="text-xs text-paper-mute">One browser origin per line. Only affects browsers — curl/scripts are never blocked by CORS. This console’s own origins (<code class="font-mono">tauri://localhost</code>, <code class="font-mono">http://tauri.localhost</code>) are always allowed.</p>
           </div>
           <div class="flex items-center justify-between sm:col-span-2">
             <div>
